@@ -44,7 +44,6 @@ class ChatClient(Protocol):
         timeout_s: float = 600.0,
         reset_cache: bool = True,
         version: Optional[str] = None,
-        check_shapes: bool = True,
     ) -> str:
         """
         Atomically apply a set of parameter updates.

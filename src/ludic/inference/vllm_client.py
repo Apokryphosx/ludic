@@ -35,8 +35,21 @@ class VLLMChatClient(ChatClient):
             - Enables push_update_atomic() to broadcast updated parameters
               directly into the vLLM worker processes.
 
-    The design ensures inference users stay lightweight, while specialized
-    fine-tuning / research clients get full direct NCCL streaming updates.
+    Args:
+        host:
+            Hostname of the vLLM OpenAI-compatible server. Defaults to "0.0.0.0".
+        port:
+            HTTP port for the vLLM server. Defaults to 8000.
+        group_port:
+            TCP port used to form the StatelessProcessGroup for NCCL-based
+            weight updates. Only used when enable_weight_updates=True.
+        connection_timeout_s:
+            Maximum number of seconds to wait for the server /health endpoint
+            to become reachable during initialization. Defaults to 60 seconds.
+            If the timeout is exceeded, the constructor raises ConnectionError.
+        enable_weight_updates:
+            If True, initialize the NCCL communicator and enable
+            push_update_atomic(); otherwise run in inference-only mode.
     """
 
     def __init__(
@@ -126,7 +139,6 @@ class VLLMChatClient(ChatClient):
                 'info' contains raw transport details and args actually sent.
         """
 
-
         # Sampling → OpenAI kwargs
         request_kwargs: Dict[str, Any] = dict(
             model=model,
@@ -135,9 +147,13 @@ class VLLMChatClient(ChatClient):
         request_kwargs.update(sampling.to_openai_kwargs())
 
         # ----------------------------------------------------------
-        # Build extra_body container for vLLM-specific parameters.
-        # The OpenAI Python SDK rejects unknown top-level kwargs,
-        # so all vLLM-specific extensions go under extra_body.
+        # vLLM-specific extensions live under `extra_body`:
+        #
+        #   - interrupt_thinking -> extra_body["vllm_xargs"]["max_think"]
+        #   - return_token_ids   -> extra_body["return_token_ids"] = True
+        #
+        # Any SamplingConfig.extras may also inject/override fields by
+        # providing an "extra_body" dict.
         # ----------------------------------------------------------
         extra_body: Dict[str, Any] = {}
 
@@ -158,7 +174,7 @@ class VLLMChatClient(ChatClient):
         if vllm_xargs:
             extra_body["vllm_xargs"] = vllm_xargs
 
-        # ---- NEW: token IDs ----
+        # Token IDs
         if return_token_ids:
             extra_body["return_token_ids"] = True
 
@@ -174,11 +190,10 @@ class VLLMChatClient(ChatClient):
         text = choice.message.content or ""
         finish_reason = choice.finish_reason
 
-        # ---- Extract token IDs if present ----
+        # Extract token IDs if present
         prompt_token_ids = getattr(resp, "prompt_token_ids", None)
         completion_token_ids = getattr(choice, "token_ids", None)
 
-        # Build ChatResponse with token data filled in
         chat_resp = ChatResponse(
             text=text,
             finish_reason=finish_reason,
@@ -186,13 +201,13 @@ class VLLMChatClient(ChatClient):
             prompt_token_ids=prompt_token_ids,
         )
 
-        # Record raw dump for debugging
         info: Dict[str, Any] = {
             "raw_response": resp.model_dump(exclude_none=True),
             "used_args": request_kwargs,
         }
 
         return chat_resp, info
+
 
 
     # ---- ChatClient.push_update_atomic --------------------------
@@ -204,7 +219,6 @@ class VLLMChatClient(ChatClient):
         timeout_s: float = 600.0,
         reset_cache: bool = True,
         version: Optional[str] = None,
-        check_shapes: bool = True,
     ) -> str:
         """
         Push updated model parameters into the running vLLM server.
