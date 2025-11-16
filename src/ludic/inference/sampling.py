@@ -33,6 +33,7 @@ class SamplingConfig:
             "top_p": self.top_p,
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
+            "seed": self.seed,
         }
 
         # `stop` being "falsy" means "don't send a stop field at all"

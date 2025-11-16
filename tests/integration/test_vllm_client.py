@@ -203,7 +203,7 @@ async def test_vllm_client_same_seed_is_deterministic(
         frequency_penalty=0.0,
         presence_penalty=0.0,
         stop=base.stop,
-        extras={**(base.extras or {}), "seed": seed_value},
+        extras=base.extras,
     )
 
     messages = [
@@ -290,7 +290,7 @@ async def test_vllm_global_think_processor_triggers_at_very_small_max_think(
         frequency_penalty=base.frequency_penalty,
         presence_penalty=base.presence_penalty,
         stop=base.stop,
-        extras={**(base.extras or {}), "seed": 123},
+        extras=base.extras,
     )
 
     messages = [
