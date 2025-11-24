@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional
 
+
 @dataclass
 class TrainerConfig:
     """
@@ -58,9 +59,9 @@ class TrainerConfig:
     eps: float = 1e-8
 
     max_grad_norm: Optional[float] = 1.0
-    
+
     # FSDP/RLHF specific settings
-    grad_accum_steps: int = 16 
+    grad_accum_steps: int = 16
     sync_every_steps: int = 1
     mixed_precision_dtype: Optional[str] = "bf16"
 

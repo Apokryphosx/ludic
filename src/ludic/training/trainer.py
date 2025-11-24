@@ -109,16 +109,13 @@ class Trainer:
 
     This variant is FSDP-aware:
 
-      - If `model` is wrapped in FSDP/FSDP2, it will:
+      - If `model` is wrapped in FSDP, it will:
             * on rank 0 only:
                 - switch to FULL_STATE_DICT
                 - gather a full state dict (no CPU offload by default)
                 - push the full (unsharded) params to the Agent's runtime
 
       - On non-FSDP models, it just uses `named_parameters()` as before.
-
-    By default, we sync to the runtime **every train step** (`sync_to_runtime=True`),
-    i.e. strictly on-policy if you use the runtime for rollouts.
     """
 
     def __init__(
@@ -129,7 +126,6 @@ class Trainer:
         batch_source: BatchSource,
         agent: Agent,
         cfg: TrainerConfig = TrainerConfig(),
-        sync_every_steps: int = 1,
         param_filter: Optional[Callable[[str, Tensor], bool]] = None,
     ) -> None:
         """
@@ -137,7 +133,7 @@ class Trainer:
             model:
                 Trainable policy model (typically a HF CausalLM-like module).
                 Must accept (input_ids, attention_mask) and expose .logits.
-                May be wrapped in FSDP/FSDP2.
+                May be wrapped in FSDP.
 
             algo:
                 RLAlgorithm = (CreditAssigner + Loss).
@@ -152,11 +148,7 @@ class Trainer:
 
             cfg:
                 TrainerConfig for device, optimizer hyperparams, pad_token_id,
-                and `grad_accum_steps`.
-
-            sync_every_steps:
-                Push the updated weights every n *macro-steps* to the
-                inference engine.
+                grad_accum_steps, and sync_every_steps.
 
             param_filter:
                 Optional predicate (name, Tensor) -> bool deciding which
@@ -173,7 +165,7 @@ class Trainer:
         self.algo = algo
         self.agent = agent
         self._batch_source = batch_source
-        self.sync_every_steps = sync_every_steps
+        self.sync_every_steps = self.cfg.sync_every_steps
         self.param_filter = param_filter
         self._train_step_idx = 0
 
@@ -232,7 +224,7 @@ class Trainer:
         all_saw_batches: List[SAWBatch] = []
 
         # ---- 1) Accumulation Loop (Micro-Steps) ------------------------
-        
+
         # Note: Gradients are *not* zeroed here. They are accumulated
         # from the previous state (which should be zero).
         self.model.train()
@@ -261,7 +253,7 @@ class Trainer:
             # ---- 1d) Loss + backward (scaled) --------------------------
             with no_sync_context:
                 loss, stats = self.algo.compute_loss(self.model, batch_tensors)
-                
+
                 # Scale loss for accumulation
                 scaled_loss = loss / grad_accum_steps
                 scaled_loss.backward()
@@ -322,32 +314,32 @@ class Trainer:
             for k, v in micro_stats.items():
                 if k in agg_stats:
                     agg_stats[k] += v
-        
+
         for k in agg_stats:
-            agg_stats[k] /= num_micro_batches # Average the values
+            agg_stats[k] /= num_micro_batches  # Average the values
 
         # Sum/Average stats from the SAWBatch metadata
         total_items = 0.0
         total_batch_size = 0.0
-        total_reward_sum = 0.0 # To calculate the new weighted average
+        total_reward_sum = 0.0  # To calculate the new weighted average
 
         for batch in saw_batches:
             num_items = float(len(batch.items))
             total_items += num_items
-            
+
             batch_size = float(batch.meta.get("batch_size", 0.0))
             avg_reward = float(batch.meta.get("avg_total_reward", 0.0))
-            
-            total_batch_size += batch_size
-            total_reward_sum += avg_reward * num_items # Weight by items
 
-        agg_stats["batch_items"] = total_items # Total items in macro-batch
-        agg_stats["batch_size"] = total_batch_size # Total tokens/etc in macro-batch
-        
+            total_batch_size += batch_size
+            total_reward_sum += avg_reward * num_items  # Weight by items
+
+        agg_stats["batch_items"] = total_items  # Total items in macro-batch
+        agg_stats["batch_size"] = total_batch_size  # Total episodes/etc in macro-batch
+
         if total_items > 0:
-             agg_stats["avg_total_reward"] = total_reward_sum / total_items
+            agg_stats["avg_total_reward"] = total_reward_sum / total_items
         else:
-             agg_stats["avg_total_reward"] = 0.0
+            agg_stats["avg_total_reward"] = 0.0
 
         return agg_stats
 
@@ -413,7 +405,7 @@ class Trainer:
 
             def push_policy_update(self, params: Mapping[str, Tensor], ...) -> str
 
-        FSDP/FSDP2-aware behavior:
+        FSDP-aware behavior:
 
             - If model is FSDP:
                 * only rank 0 (if dist initialized) does anything
@@ -485,5 +477,5 @@ class Trainer:
         if not params:
             return
 
-        # Delegate to Agent → ChatClient → vLLM
+        # Delegate to Agent
         self.agent.push_policy_update(params)
