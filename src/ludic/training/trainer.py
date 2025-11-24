@@ -5,6 +5,12 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 from torch import nn, optim, Tensor
+import torch.distributed as dist
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    StateDictType,
+    FullStateDictConfig,
+)
 
 from ludic.agent import Agent
 from ludic.training.algorithm import RLAlgorithm
@@ -95,6 +101,19 @@ class Trainer:
         Agent.push_policy_update(...)   # optional, online weight sync
 
     Trainer is agnostic to envs, contexts, rollouts, and tokenization.
+
+    This variant is FSDP-aware:
+
+      - If `model` is wrapped in FSDP/FSDP2, it will:
+            * on rank 0 only:
+                - switch to FULL_STATE_DICT
+                - gather a full state dict (no CPU offload by default)
+                - push the full (unsharded) params to the Agent's runtime
+
+      - On non-FSDP models, it just uses `named_parameters()` as before.
+
+    By default, we sync to the runtime **every train step** (`sync_to_runtime=True`),
+    i.e. strictly on-policy if you use the runtime for rollouts.
     """
 
     def __init__(
@@ -113,6 +132,7 @@ class Trainer:
             model:
                 Trainable policy model (typically a HF CausalLM-like module).
                 Must accept (input_ids, attention_mask) and expose .logits.
+                May be wrapped in FSDP/FSDP2.
 
             algo:
                 RLAlgorithm = (WeightingStrategy + Loss).
@@ -123,21 +143,26 @@ class Trainer:
 
             agent:
                 Ludic Agent wrapping a ChatClient (e.g., VLLMChatClient).
-                Used ONLY for pushing updated weights into the runtime.
+                Used for pushing updated weights into the runtime.
 
             cfg:
                 TrainerConfig for device, optimizer hyperparams, pad_token_id, etc.
 
             sync_every_steps:
-                If > 0, call Agent.push_policy_update(...) every N train steps.
+                Push the updated weights every n steps to the inference engine.
 
             param_filter:
-                Optional predicate (name, tensor) -> bool deciding which
+                Optional predicate (name, Tensor) -> bool deciding which
                 parameters get pushed into the runtime. If None, defaults to
-                `p.requires_grad`.
+                `p.requires_grad` for non-FSDP models; for FSDP, no default
+                filter (caller should pass one if they want to restrict).
         """
         self.cfg = cfg
-        self.model = model.to(cfg.model_device)
+
+        # Assume caller has already done any FSDP wrapping / device placement.
+        # We do NOT unconditionally .to(device) for FSDP; that’s the caller’s job.
+        self.model = model.to(cfg.model_device) if not isinstance(model, FSDP) else model  # type: ignore[arg-type]
+
         self.algo = algo
         self.agent = agent
         self._batch_source = batch_source
@@ -225,7 +250,7 @@ class Trainer:
         self._train_step_idx += 1
 
         # ---- 4) Push policy update into runtime ------------------------
-        if self.sync_every_steps > 0 and (self._train_step_idx % self.sync_every_steps == 0):
+        if self._train_step_idx % self.sync_every_steps == 0:
             self._push_weights_to_runtime()
 
         # ---- 5) Enrich stats -------------------------------------------
@@ -288,7 +313,7 @@ class Trainer:
         asyncio.run(self.train(num_steps, log_every=log_every, log_fn=log_fn))
 
     # ------------------------------------------------------------------
-    # Weight sync into runtime via Agent
+    # Weight sync into runtime via Agent (FSDP-aware)
     # ------------------------------------------------------------------
 
     def _push_weights_to_runtime(self) -> None:
@@ -299,7 +324,21 @@ class Trainer:
 
             def push_policy_update(self, params: Mapping[str, Tensor], ...) -> str
 
-        Trainer stays agnostic about ChatClient / vLLM details.
+        FSDP/FSDP2-aware behavior:
+
+            - If model is FSDP:
+                * only rank 0 (if dist initialized) does anything
+                * uses FULL_STATE_DICT with rank0_only=True
+                * gathers a full, unsharded state_dict on model_device
+                * optionally filters params, then hands the dict to Agent
+
+            - If model is not FSDP:
+                * uses named_parameters() with the same filter policy.
+
+        Note: this assumes that the runtime (e.g. vLLM client) expects tensors
+        on the device implied by cfg.runtime_device (or cfg.model_device if None),
+        and will use NCCL from there. If you care, set cfg.runtime_device
+        accordingly.
         """
         if not hasattr(self.agent, "push_policy_update"):
             raise RuntimeError(
@@ -307,10 +346,42 @@ class Trainer:
                 "(missing push_policy_update)."
             )
 
+        # Only rank 0 talks to the runtime in distributed mode
+        if dist.is_available() and dist.is_initialized():
+            if dist.get_rank() != 0:
+                return
+
         runtime_device = torch.device(
             self.cfg.runtime_device or self.cfg.model_device
         )
 
+        # ---------------- FSDP path ----------------
+        if isinstance(self.model, FSDP):
+            # Gather full, unsharded state dict on the model device.
+            full_cfg = FullStateDictConfig(
+                offload_to_cpu=False,   # full model stays on GPU; rollouts dominate anyway
+                rank0_only=True,
+            )
+            with FSDP.state_dict_type(
+                self.model,
+                StateDictType.FULL_STATE_DICT,
+                full_cfg,
+            ):
+                full_state = self.model.state_dict()
+
+            params: Dict[str, Tensor] = {}
+            for name, tensor in full_state.items():
+                if self.param_filter is not None and not self.param_filter(name, tensor):
+                    continue
+                params[name] = tensor.detach().to(runtime_device)
+
+            if not params:
+                return
+
+            self.agent.push_policy_update(params)
+            return
+
+        # ---------------- non-FSDP path ----------------
         params: Dict[str, Tensor] = {}
         for name, p in self.model.named_parameters():
             if self.param_filter is not None:
