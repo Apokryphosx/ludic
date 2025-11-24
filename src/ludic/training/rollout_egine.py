@@ -116,6 +116,7 @@ class RolloutEngine:
             rollout = await run_episode(
                 env=env,
                 agent=self.agent,
+                action_parser=request.action_parser,
                 max_steps=max_steps,
                 sampling_args=sargs,
                 ctx=ctx,

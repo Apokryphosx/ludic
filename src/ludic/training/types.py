@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
+from ludic.parsers import Parser
 from ludic.types import JSON, Rollout, SamplingArgs, Step
 
 
@@ -69,6 +70,7 @@ class RolloutRequest:
     sampling_args: Optional[SamplingArgs] = None
     system_prompt: Optional[str] = None
     num_episodes: int = 1
+    action_parser: Optional[Parser] = None
     meta: Dict[str, JSON] = field(default_factory=dict)
 
 # ---------------------------------------------------------------------------
