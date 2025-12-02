@@ -8,10 +8,9 @@ from pathlib import Path
 from dataclasses import replace
 from typing import Callable, Dict, List, Optional
 
-from ludic.agent import Agent
 from ludic.context.base import ContextStrategy
 from ludic.env import Env
-from ludic.interaction import run_episode
+from ludic.interaction.base import InteractionProtocol
 from ludic.types import Rollout, SamplingArgs
 
 from ludic.training.types import (
@@ -29,22 +28,25 @@ from ludic.training.types import (
 # Factory aliases
 # ---------------------------------------------------------------------------
 
-EnvFactory = Callable[..., Env]          # Build a fresh Env given kwargs
-CtxFactory = Callable[..., ContextStrategy]
+EnvFactory = Callable[..., Env]  # Build a fresh Env given kwargs
+ProtocolFactory = Callable[[], InteractionProtocol]  # Build a fresh Protocol
 
 EnvRegistry = Dict[str, EnvFactory]
-CtxRegistry = Dict[str, CtxFactory]
+# CtxRegistry is no longer needed here; it's used to build the Agent/Protocol
+CtxRegistry = Dict[str, Callable[..., ContextStrategy]]
 
 
 class RolloutEngine:
     """
-    Dumb, stateless rollout engine:
+    Stateless rollout executor:
 
-      - given a list of RolloutRequests
-      - spawns Env / Context instances via registries
-      - runs them with an asyncio.Semaphore
-      - returns List[Rollout]
-      - optionally writes each rollout to JSONL
+      - Is configured with a ProtocolFactory and an EnvRegistry.
+      - For each rollout, it:
+        1. Spawns a task.
+        2. Calls the ProtocolFactory to create a *new* protocol/agent worker.
+        3. Calls the EnvRegistry to create a *new* env.
+        4. Runs the episode and returns the rollout.
+      - Optionally writes each rollout to JSONL
 
     Extended variant:
 
@@ -61,14 +63,12 @@ class RolloutEngine:
     def __init__(
         self,
         *,
-        agent: Agent,
+        protocol_factory: ProtocolFactory,
         env_registry: EnvRegistry,
-        ctx_registry: CtxRegistry,
         jsonl_path: Optional[str] = None,
     ) -> None:
-        self.agent = agent
+        self.protocol_factory = protocol_factory
         self.env_registry = dict(env_registry)
-        self.ctx_registry = dict(ctx_registry)
         self.jsonl_path = jsonl_path
 
         if self.jsonl_path:
@@ -83,14 +83,6 @@ class RolloutEngine:
             factory = self.env_registry[spec.kind]
         except KeyError as exc:
             raise KeyError(f"Unknown env kind: {spec.kind!r}") from exc
-        return factory(**spec.kwargs)
-
-    def _build_ctx(self, spec: CtxSpec) -> ContextStrategy:
-        """Instantiate a ContextStrategy from a CtxSpec via the ctx_registry."""
-        try:
-            factory = self.ctx_registry[spec.kind]
-        except KeyError as exc:
-            raise KeyError(f"Unknown ctx kind: {spec.kind!r}") from exc
         return factory(**spec.kwargs)
 
     # ---- internal helpers ------------------------------------------------
@@ -108,31 +100,31 @@ class RolloutEngine:
         Run a single rollout for a given RolloutRequest.
 
         episode_idx is a global index across all requests; purely for logging.
+        This function is run concurrently in its own task.
         """
         async with sem:
+            # 1. Create a fresh, independent protocol worker (and its agent)
+            protocol = self.protocol_factory()
+
+            # 2. Create a fresh env
             env = self._build_env(request.env)
-            ctx = self._build_ctx(request.ctx)
+
             sargs: SamplingArgs = request.sampling_args or {}
 
-            # 1. Determine the seed to use for env.reset()
-            # If the request forces a seed, use it.
-            # Otherwise, use the global_idx for variety.
+            # 3. Determine the seed to use for env.reset()
             run_seed = request.seed if request.seed is not None else episode_idx
             is_forced_seed = request.seed is not None
 
-            rollout = await run_episode(
+            # 4. Run the episode using the fresh protocol and env
+            rollout = await protocol.run(
                 env=env,
-                agent=self.agent,
-                action_parser=request.action_parser,
                 max_steps=max_steps,
                 seed=run_seed,
                 sampling_args=sargs,
-                ctx=ctx,
-                system_prompt=request.system_prompt,
                 timeout_s=timeout_s,
             )
 
-            # 2. Log the seed that was actually used
+            # 5. Log metadata
             rollout.meta.setdefault("episode_idx", episode_idx)
             rollout.meta.setdefault("request_meta", {})
             rollout.meta["request_meta"].update(request.meta)
@@ -142,7 +134,6 @@ class RolloutEngine:
                     "max_steps": max_steps,
                     "timeout_s": timeout_s,
                     "env_kind": request.env.kind,
-                    "ctx_kind": request.ctx.kind,
                     "used_seed": run_seed,
                     "forced_seed": is_forced_seed,
                 }
@@ -151,6 +142,7 @@ class RolloutEngine:
             if self.jsonl_path:
                 self._append_jsonl(rollout)
 
+            # 6. The protocol and env go out of scope and are garbage collected
             return rollout
 
     def _append_jsonl(self, rollout: Rollout) -> None:
@@ -305,8 +297,8 @@ class RolloutEngine:
                                 "prev_obs": step.prev_obs,
                                 "action": step.action,
                                 "total_reward": r.total_reward,
-                                **(r.meta),       # Rollout-level meta
-                                **(step.info),    # Step-level info
+                                **(r.meta),  # Rollout-level meta
+                                **(step.info),  # Step-level info
                             },
                         )
                     )
@@ -324,8 +316,8 @@ class RolloutEngine:
                 state_text = step.prev_obs
                 action_text = step.action
 
-                state_ids = tokenize(state_text)        # type: ignore[arg-type]
-                action_ids = tokenize(action_text)      # type: ignore[arg-type]
+                state_ids = tokenize(state_text)  # type: ignore[arg-type]
+                action_ids = tokenize(action_text)  # type: ignore[arg-type]
 
                 input_ids = state_ids + action_ids
                 attention_mask = [1] * len(input_ids)
@@ -344,8 +336,8 @@ class RolloutEngine:
                             "prev_obs": step.prev_obs,
                             "action": step.action,
                             "total_reward": r.total_reward,
-                            **(r.meta),       # Rollout-level meta
-                            **(step.info),    # Step-level info
+                            **(r.meta),  # Rollout-level meta
+                            **(step.info),  # Step-level info
                         },
                     )
                 )
@@ -466,7 +458,7 @@ class GRPOBatchSource:
             )
         if group_size <= 0:
             raise ValueError("GRPOBatchSource: group_size must be > 0.")
-            
+
         self._engine = orchestrator
         self._credit_assigner = credit_assigner
         self._requests_fn = requests_fn
@@ -476,9 +468,9 @@ class GRPOBatchSource:
         self._concurrency = concurrency
         self._retokenize = retokenize
         self._tokenize = tokenize
-        
+
         # Used for generating unique seeds
-        self._rng = random.Random() 
+        self._rng = random.Random()
 
     def _get_group_env_seed(self, base_req: RolloutRequest) -> int:
         """Determines the single env seed for a group."""
@@ -488,21 +480,22 @@ class GRPOBatchSource:
         return self._rng.randint(0, 2**32 - 1)
 
     def _expand_requests(
-        self, 
-        base_requests: List[RolloutRequest]
+        self, base_requests: List[RolloutRequest]
     ) -> List[RolloutRequest]:
         """
         Expands a list of N base requests into N * G requests.
         """
         expanded_requests: List[RolloutRequest] = []
-        
+
         for base_req in base_requests:
             # 1. Determine the single environment seed for this group
             group_env_seed = self._get_group_env_seed(base_req)
 
             # 2. Get the base sampling seed (if any)
             base_sampling_args = base_req.sampling_args or {}
-            base_sampling_seed = base_sampling_args.get("seed", self._rng.randint(0, 2**32 - 1))
+            base_sampling_seed = base_sampling_args.get(
+                "seed", self._rng.randint(0, 2**32 - 1)
+            )
 
             # 3. Create G requests for this group
             for i in range(self._group_size):
@@ -511,7 +504,7 @@ class GRPOBatchSource:
                     **base_sampling_args,
                     "seed": base_sampling_seed + i,
                 }
-                
+
                 # Create a copy of the request, forcing the
                 # group env seed and new sampling args.
                 new_req = replace(
@@ -521,7 +514,7 @@ class GRPOBatchSource:
                     num_episodes=1,  # Each request is now 1 episode
                 )
                 expanded_requests.append(new_req)
-                
+
         return expanded_requests
 
     async def next_batch(self) -> SAWBatch:
@@ -530,7 +523,7 @@ class GRPOBatchSource:
         """
         # 1. Get the N base requests from the user
         base_requests = self._requests_fn()
-        
+
         # 2. Expand them to N * G requests
         expanded_requests = self._expand_requests(base_requests)
 

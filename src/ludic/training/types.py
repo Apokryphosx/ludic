@@ -43,21 +43,19 @@ class RolloutRequest:
     """
     Template for one or more rollouts.
 
-    This is *pure data*; Orchestrator will:
+    This is *pure data*; RolloutEngine will:
 
-        - resolve env/ctx via registries from (env.kind, ctx.kind)
-        - call the factories with env.kwargs / ctx.kwargs
-        - run `num_episodes` independent episodes with this config
+        - resolve env via registry from (env.kind)
+        - call the factory with env.kwargs
+        - run `num_episodes` independent episodes using the
+          engine's pre-configured InteractionProtocol.
 
     Fields:
-      - env / ctx:
-            EnvSpec / CtxSpec, resolved via env_registry / ctx_registry.
-
+      - env:
+            EnvSpec, resolved via env_registry.
+            
       - sampling_args:
-            Passed directly to Agent via run_episode (temperature, top_p, etc.).
-
-      - system_prompt:
-            Optional system message for each episode.
+            Passed directly to Agent via protocol.run().
 
       - num_episodes:
             How many episodes to run with this configuration.
@@ -66,12 +64,9 @@ class RolloutRequest:
             Arbitrary JSON metadata that gets merged into Rollout.meta["request_meta"].
     """
     env: EnvSpec
-    ctx: CtxSpec
     seed: Optional[int] = None
     sampling_args: Optional[SamplingArgs] = None
-    system_prompt: Optional[str] = None
     num_episodes: int = 1
-    action_parser: Optional[Parser] = None
     meta: Dict[str, JSON] = field(default_factory=dict)
 
 # ---------------------------------------------------------------------------

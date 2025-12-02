@@ -1,15 +1,16 @@
 import pytest
 
 from ludic.context.full_dialog import FullDialog
-from ludic.interaction import run_episode
+from ludic.interaction.single_agent import SingleAgentSyncProtocol
 from ludic.agent import Agent
 from ludic.inference.client import ChatResponse
 from ludic.parsers import (
     cot_prefix_parser,
     xml_move_parser,
     compose_parsers,
+    Parser,
 )
-from tests._mocks import MockEnv, MockClient
+from tests._mocks import MockEnv, MockClient, MockAgent, _mock_parser
 
 
 # ---------------------------------------------------------------------
@@ -19,14 +20,14 @@ from tests._mocks import MockEnv, MockClient
 @pytest.mark.asyncio
 async def test_happy_path_terminates_immediately():
     env = MockEnv(max_steps=3, target="1")
-    agent = Agent(client=MockClient(text="1"), model="mock")
+    # MockAgent provides a default ctx and a pass-through parser
+    agent = MockAgent(client=MockClient(text="1"))
+    protocol = SingleAgentSyncProtocol(agent=agent)
 
-    rollout = await run_episode(
+    rollout = await protocol.run(
         env=env,
-        agent=agent,
         max_steps=5,
         sampling_args={},
-        ctx=FullDialog(),
     )
 
     assert rollout.steps[-1].terminated is True
@@ -40,14 +41,14 @@ async def test_truncation_when_agent_is_wrong():
             return ChatResponse(text="nope"), {"used_args": sampling}
 
     env = MockEnv(max_steps=2, target="1")
-    agent = Agent(client=WrongClient(), model="mock")
+    # MockAgent provides a default ctx and a pass-through parser
+    agent = MockAgent(client=WrongClient())
+    protocol = SingleAgentSyncProtocol(agent=agent)
 
-    rollout = await run_episode(
+    rollout = await protocol.run(
         env=env,
-        agent=agent,
         max_steps=10,
         sampling_args={},
-        ctx=FullDialog(),
     )
 
     assert rollout.steps[-1].truncated is True
@@ -62,7 +63,7 @@ async def test_truncation_when_agent_is_wrong():
 async def test_run_episode_uses_action_parser_and_logs_parsed_action():
     """
     Ensure that:
-      - run_episode uses the semantic Parser API
+      - protocol.run() uses the agent's configured parser
       - Step.action keeps the raw LLM text
       - Step.info['parsed_action'] is the parsed action
       - parser reward is added to env reward
@@ -73,23 +74,30 @@ async def test_run_episode_uses_action_parser_and_logs_parsed_action():
 
     # LLM emits a valid CoT-prefixed XML move
     raw_llm_output = "<think>some reasoning</think>\n<move>  A1  </move>"
-    agent = Agent(client=MockClient(text=raw_llm_output), model="mock")
 
     # Compose strict semantic parsers:
     # 1. cot_prefix_parser -> extracts everything after </think>
     # 2. xml_move_parser   -> extracts inner <move>
-    action_parser = compose_parsers(
+    action_parser: Parser = compose_parsers(
         cot_prefix_parser,
         xml_move_parser,
     )
 
-    rollout = await run_episode(
+    # Agent is now created with its context and parser
+    agent = Agent(
+        client=MockClient(text=raw_llm_output),
+        model="mock",
+        ctx=FullDialog(),
+        parser=action_parser
+    )
+    
+    protocol = SingleAgentSyncProtocol(agent=agent)
+
+    rollout = await protocol.run(
         env=env,
-        agent=agent,
         max_steps=5,
         sampling_args={},
-        ctx=FullDialog(),
-        action_parser=action_parser,
+        # ctx and action_parser are no longer passed here
     )
 
     assert rollout.length >= 1

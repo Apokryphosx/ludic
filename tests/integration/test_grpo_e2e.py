@@ -7,19 +7,19 @@ import pytest
 
 from ludic.env import Env
 from ludic.types import Observation, Info, StepOutcome, SamplingArgs
-from ludic.context.full_dialog import FullDialog
 from ludic.training.types import (
     RolloutRequest,
     EnvSpec,
-    CtxSpec,
 )
 from ludic.training.rollout_engine import (
     RolloutEngine,
     GRPOBatchSource,
+    ProtocolFactory,
 )
 from ludic.training.credit_assignment import (
     GroupNormalizedReturn,
 )
+from ludic.interaction.single_agent import SingleAgentSyncProtocol
 
 from tests._mocks import SeedableMockAgent
 
@@ -35,6 +35,7 @@ class SeedableMockEnv(Env):
     - reset() obs includes the seed.
     - step() gives +1 for a "correct" action, -0.1 otherwise.
     """
+
     def __init__(self, correct_action: str = "A") -> None:
         self.correct_action = correct_action
         self._obs: Observation = "Not reset"
@@ -52,14 +53,14 @@ class SeedableMockEnv(Env):
     def step(self, action: str) -> StepOutcome:
         self._t += 1
         action_clean = action.strip().upper()
-        
+
         if action_clean == self.correct_action:
             reward = 1.0
             terminated = True
             self._obs = "✅ Correct"
         else:
             reward = -0.1
-            terminated = True # End episode on first action for simplicity
+            terminated = True  # End episode on first action for simplicity
             self._obs = f"❌ Incorrect (got {action_clean})"
 
         return StepOutcome(
@@ -67,7 +68,7 @@ class SeedableMockEnv(Env):
             reward=reward,
             truncated=False,
             terminated=terminated,
-            info={"action_taken": action_clean}
+            info={"action_taken": action_clean},
         )
 
     def current_obs(self) -> Observation:
@@ -78,9 +79,9 @@ class SeedableMockEnv(Env):
 # 2. The End-to-End Test
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
-async def test_grpo_e2e_seed_grouping_and_credit(
-) -> None:
+async def test_grpo_e2e_seed_grouping_and_credit() -> None:
     """
     Tests the full GRPO data pipeline:
     1. GRPOBatchSource expands N requests to N*G.
@@ -89,9 +90,9 @@ async def test_grpo_e2e_seed_grouping_and_credit(
     4. The *Mock* Agent is deterministic on sampling_seed (different actions).
     5. GroupNormalizedReturn computes advantages based on the seed groups.
     """
-    
+
     # ---- 1. Arrange ----
-    
+
     N_GROUPS = 2
     G_PER_GROUP = 2
     seed_group_A = 100
@@ -100,13 +101,11 @@ async def test_grpo_e2e_seed_grouping_and_credit(
         "env_A": lambda **kwargs: SeedableMockEnv(correct_action="A"),
         "env_B": lambda **kwargs: SeedableMockEnv(correct_action="B"),
     }
-    ctx_registry = {
-        "full_dialog": lambda **kwargs: FullDialog(**kwargs),
-    }
+    # ctx_registry is no longer needed here
 
     base_seed_A = 9000
     base_seed_B = 8000
-    
+
     # This map defines the *guaranteed* agent behavior
     seed_to_action_map = {
         base_seed_A + 0: "A",  # Group A, Rollout 0 -> Correct (1.0)
@@ -116,36 +115,48 @@ async def test_grpo_e2e_seed_grouping_and_credit(
     }
 
     # Use the new SeedableMockAgent
-    agent = SeedableMockAgent(seed_map=seed_to_action_map)
-    
+    # agent = SeedableMockAgent(seed_map=seed_to_action_map) # <-- Removed
+
     credit_assigner = GroupNormalizedReturn(normalize_adv=True)
 
+    # --- Create the Protocol Factory ---
+    # This creates a new agent worker for each concurrent rollout
+    def create_protocol() -> InteractionProtocol:
+        agent = SeedableMockAgent(seed_map=seed_to_action_map)
+        return SingleAgentSyncProtocol(agent=agent)
+
+    protocol_factory: ProtocolFactory = create_protocol
+    # -----------------------------------
+
     engine = RolloutEngine(
-        agent=agent,
+        protocol_factory=protocol_factory,
         env_registry=env_registry,
-        ctx_registry=ctx_registry,
     )
 
     def make_base_requests() -> List[RolloutRequest]:
         s_args_A: SamplingArgs = {
-            "temperature": 0.7, "max_tokens": 5, "seed": base_seed_A,
-            "extras": {"extra_body": {"return_token_ids": True}}
+            "temperature": 0.7,
+            "max_tokens": 5,
+            "seed": base_seed_A,
+            "extras": {"extra_body": {"return_token_ids": True}},
         }
         s_args_B: SamplingArgs = {
-            "temperature": 0.7, "max_tokens": 5, "seed": base_seed_B,
-            "extras": {"extra_body": {"return_token_ids": True}}
+            "temperature": 0.7,
+            "max_tokens": 5,
+            "seed": base_seed_B,
+            "extras": {"extra_body": {"return_token_ids": True}},
         }
 
         req_A = RolloutRequest(
             env=EnvSpec(kind="env_A", kwargs={}),
-            ctx=CtxSpec(kind="full_dialog", kwargs={}),
-            seed=seed_group_A, # Force env seed for Group A
+            # ctx=CtxSpec(kind="full_dialog", kwargs={}), # <-- Removed
+            seed=seed_group_A,  # Force env seed for Group A
             sampling_args=s_args_A,
         )
         req_B = RolloutRequest(
             env=EnvSpec(kind="env_B", kwargs={}),
-            ctx=CtxSpec(kind="full_dialog", kwargs={}),
-            seed=seed_group_B, # Force env seed for Group B
+            # ctx=CtxSpec(kind="full_dialog", kwargs={}), # <-- Removed
+            seed=seed_group_B,  # Force env seed for Group B
             sampling_args=s_args_B,
         )
         return [req_A, req_B]
@@ -161,7 +172,7 @@ async def test_grpo_e2e_seed_grouping_and_credit(
     )
 
     # ---- 2. Act ----
-    
+
     saw_batch = await batch_source.next_batch()
 
     # ---- 3. Assert ----
@@ -175,9 +186,9 @@ async def test_grpo_e2e_seed_grouping_and_credit(
         rollouts[rollout_id]["id"] = rollout_id
         rollouts[rollout_id]["used_seed"] = item.meta["engine"]["used_seed"]
         rollouts[rollout_id]["prev_obs"] = item.meta["prev_obs"]
-        rollouts[rollout_id]["reward"] = item.meta["reward"] 
+        rollouts[rollout_id]["reward"] = item.meta["reward"]
         rollouts[rollout_id]["weight"] = item.weight
-        
+
         assert "prompt_token_ids" in item.meta
         assert "completion_token_ids" in item.meta
 
@@ -190,10 +201,10 @@ async def test_grpo_e2e_seed_grouping_and_credit(
 
     rollouts_in_A = [r for r in rollout_list if r["used_seed"] == seed_group_A]
     rollouts_in_B = [r for r in rollout_list if r["used_seed"] == seed_group_B]
-    
+
     assert len(rollouts_in_A) == G_PER_GROUP
     assert len(rollouts_in_B) == G_PER_GROUP
-    
+
     # --- Assert 2: Deterministic Env Start ---
     obs_A = {r["prev_obs"] for r in rollouts_in_A}
     assert len(obs_A) == 1
@@ -204,7 +215,7 @@ async def test_grpo_e2e_seed_grouping_and_credit(
     assert len(obs_B) == 1
     assert f"seed {seed_group_B}" in list(obs_B)[0]
     assert "Correct action is B" in list(obs_B)[0]
-    
+
     assert obs_A != obs_B
 
     # --- Assert 3: Deterministic Agent Actions ---
@@ -215,7 +226,7 @@ async def test_grpo_e2e_seed_grouping_and_credit(
     assert rewards_B == {1.0, -0.1}
 
     # --- Assert 4: Correct Credit Assignment ---
-    # Group A: rewards = [1.0, -0.1]. 
+    # Group A: rewards = [1.0, -0.1].
     #   mean = 0.45, adv = [0.55, -0.55], std = 0.55, norm_adv = [1.0, -1.0]
     weights_A = {r["weight"] for r in rollouts_in_A}
     assert len(weights_A) == 2

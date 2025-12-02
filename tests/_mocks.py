@@ -9,6 +9,14 @@ from ludic.inference.client import ChatResponse, ChatClient
 from ludic.inference.sampling import SamplingConfig
 from ludic.agent import Agent
 from ludic.env import Env
+from ludic.context.base import ContextStrategy
+from ludic.context.full_dialog import FullDialog
+from ludic.parsers import Parser, ParseResult
+
+# ---- A default pass-through parser for mocks ----
+def _mock_parser(raw: str) -> ParseResult:
+    """A simple parser that just passes the text through."""
+    return ParseResult(action=raw, reward=0.0, obs=None)
 
 # ---- Mock client ---------------------------------------------------------
 
@@ -31,10 +39,16 @@ class MockClient:
 class MockAgent(Agent):
     """
     Real Agent wired to the MockClient.
-    No need to override act(); base Agent uses client.complete().
+    Uses FullDialog and a pass-through parser by default.
     """
-    def __init__(self) -> None:
-        super().__init__(client=MockClient(), model="mock")
+    def __init__(
+        self, 
+        client: ChatClient = MockClient(), 
+        model: str = "mock",
+        ctx: ContextStrategy = FullDialog(),
+        parser: Parser = _mock_parser
+    ) -> None:
+        super().__init__(client=client, model=model, ctx=ctx, parser=parser)
 
 
 # ---- NEW: Seedable Mock Client for GRPO Test ----
@@ -74,8 +88,18 @@ class SeedableMockAgent(Agent):
     """
     An agent wired to the SeedableMockClient.
     """
-    def __init__(self, seed_map: Dict[int, str]) -> None:
-        super().__init__(client=SeedableMockClient(seed_map), model="seedable_mock")
+    def __init__(
+        self, 
+        seed_map: Dict[int, str],
+        ctx: ContextStrategy = FullDialog(),
+        parser: Parser = _mock_parser
+    ) -> None:
+        super().__init__(
+            client=SeedableMockClient(seed_map), 
+            model="seedable_mock",
+            ctx=ctx,
+            parser=parser
+        )
 
 
 # ---- Mock env ------------------------------------------------------------

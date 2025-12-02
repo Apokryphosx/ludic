@@ -4,12 +4,11 @@ from typing import Any, Dict, List, Optional, Tuple, Mapping
 
 import torch
 
-from ludic.types import SamplingArgs, Observation, Info
-from ludic.inference.client import ChatClient
+from ludic.types import SamplingArgs, Observation, Info, Message
+from ludic.inference.client import ChatClient, ChatResponse
 from ludic.inference.sampling import SamplingConfig, resolve_sampling_args
 from ludic.context.base import ContextStrategy
-from ludic.context.full_dialog import FullDialog
-from ludic.parsers import Parser, ParseResult, xml_move_parser
+from ludic.parsers import Parser, ParseResult
 
 class Agent:
     """
@@ -44,40 +43,39 @@ class Agent:
         self.last_info: Dict[str, Any] = {}
 
     def reset(self, system_prompt: Optional[str] = None) -> None:
-        """
-        Resets the agent's internal memory (ContextStrategy)
-        with an optional system prompt.
-        """
+        """Resets the agent's internal context."""
         self._ctx.reset(system_prompt=system_prompt)
+        
+    def on_env_reset(self, obs: Observation, info: Info):
+        """Called by the protocol *after* env.reset()."""
+        self._ctx.on_env_reset(obs, info)
+        
+    def on_after_step(self, obs: Observation, info: Info):
+        """Called by the protocol *after* env.step()."""
+        self._ctx.on_after_step(obs, info)
 
     async def act(
         self,
-        obs: Observation,
-        info: Info,
         sampling_args: SamplingArgs,
         timeout_s: Optional[float] = None,
     ) -> Tuple[ParseResult, str, Dict[str, Any]]:
         """
-        Runs the full observe -> think -> act -> parse cycle.
+        Runs the think -> act -> parse cycle based on current context.
         
-        This is called by an InteractionProtocol.
+        This method does *not* take obs/info, as those are fed to the
+        agent via on_env_reset() and on_after_step().
         
         Args:
-            obs: The observation from the environment.
-            info: The info dict from the environment.
             sampling_args: The sampling configuration for this step.
             timeout_s: Optional timeout for the inference call.
             
         Returns:
             A tuple of (ParseResult, raw_action_text, client_info_dict).
         """
-        # 1. Observe (update memory with the latest env state)
-        self._ctx.on_after_step(obs, info) 
+        # 1. Think (prepare prompt messages from context)
+        messages: List[Message] = self._ctx.on_before_act()
         
-        # 2. Think (prepare prompt messages from context)
-        messages = self._ctx.on_before_act()
-        
-        # 3. Act (run inference)
+        # 2. Act (run inference)
         sampling: SamplingConfig = resolve_sampling_args(sampling_args)
         coro = self._client.complete(
             model=self._model,
@@ -91,10 +89,16 @@ class Agent:
 
         self.last_info = dict(client_info)
         
-        # 4. Update memory with the agent's own response
+        # Also merge token IDs from the response if they exist
+        if resp.prompt_token_ids is not None:
+            self.last_info["prompt_token_ids"] = resp.prompt_token_ids
+        if resp.completion_token_ids is not None:
+            self.last_info["completion_token_ids"] = resp.completion_token_ids
+        
+        # 3. Update memory with the agent's own response
         self._ctx.on_after_act(resp)
         
-        # 5. Parse (format the raw text action)
+        # 4. Parse (format the raw text action)
         raw_action = resp.text
         parse_result = self._parser(raw_action)
         
@@ -108,17 +112,12 @@ class Agent:
         reset_cache: bool = True,
         version: Optional[str] = None,
     ) -> str:
-        """
-        Push updated policy parameters into the underlying runtime.
-
-        Delegates to the ChatClient's push_update_atomic implementation.
-        """
+        """Pushes updated policy parameters to the underlying runtime."""
         if not hasattr(self._client, "push_update_atomic"):
             raise RuntimeError(
                 "Underlying ChatClient does not support policy weight updates "
                 "(missing push_update_atomic)."
             )
-
         return self._client.push_update_atomic(
             params,
             timeout_s=timeout_s,
