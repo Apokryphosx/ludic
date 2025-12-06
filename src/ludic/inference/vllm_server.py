@@ -2,7 +2,7 @@ import asyncio
 import os
 import signal
 from argparse import Namespace
-from typing import Any, Awaitable, Sequence, Set, Optional
+from typing import Any, Awaitable, Sequence, Set, Optional, Tuple
 
 # Use V1 engine explicitly.
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -119,6 +119,37 @@ class WeightSyncWorkerExtension:
         self.pynccl_comm.group.barrier()
         # vLLM model runner will apply the incoming weights
         self.model_runner.model.load_weights(weights=[(name, weight)])  # type: ignore[attr-defined]
+
+    def update_param_batch(
+        self, metadata_list: Sequence[Tuple[str, str, Sequence[int]]]
+    ) -> None:
+        """
+        Called via engine.collective_rpc on all workers.
+        Iterates through the list, creating empty tensors and receiving broadcasts.
+        """
+        if self.pynccl_comm is None or self.client_rank is None:
+            raise RuntimeError(
+                "Communicator not initialized. Call `init_communicator` first."
+            )
+
+        assert self.device is not None
+
+        for name, dtype_str, shape_list in metadata_list:
+            torch_dtype = getattr(torch, dtype_str.split(".")[-1])
+            shape = tuple(shape_list)
+
+            # allocate empty on GPU
+            weight = torch.empty(shape, dtype=torch_dtype, device=self.device)
+
+            # NCCL Receive
+            self.pynccl_comm.broadcast(weight, src=self.client_rank)
+
+            # Apply
+            # vLLM model runner will apply the incoming weights
+            self.model_runner.model.load_weights(weights=[(name, weight)])  # type: ignore[attr-defined]
+
+        # Barrier to ensure all workers are done
+        self.pynccl_comm.group.barrier()
 
     def close_communicator(self) -> None:
         """
@@ -312,8 +343,8 @@ async def run_server(args: Namespace) -> None:
     app: FastAPI = build_app(args)
 
     # ------------------------ control-plane endpoints ---------------------
-    
-    #TODO: override 
+
+    # TODO: override
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -372,6 +403,34 @@ async def run_server(args: Namespace) -> None:
                 )
 
         create_background_task(throttled_update())
+        return {"status": "ok"}
+
+    @app.post("/update_param_batch")
+    async def update_param_batch(request: Request) -> dict[str, str]:
+        """
+        Receives the batch metadata manifest.
+        Triggers the worker extension to enter the receiving loop.
+        """
+        data = await request.json()
+        metadata = data.get("metadata", [])  # List of {name, dtype, shape}
+
+        # Convert dicts to tuples for RPC serialization safety
+        # (name, dtype, shape)
+        rpc_args = [(m["name"], m["dtype"], m["shape"]) for m in metadata]
+
+        async def do_update_batch() -> None:
+            async with weight_update_semaphore:
+                # This RPC call will block the workers in the receiving loop
+                # until the client finishes broadcasting all tensors.
+                await engine.collective_rpc("update_param_batch", args=(rpc_args,))
+
+                # Reset cache and bump version after full batch
+                await engine.reset_prefix_cache()
+                global RUNTIME_VERSION
+                async with RUNTIME_VERSION_LOCK:
+                    RUNTIME_VERSION += 1
+
+        create_background_task(do_update_batch())
         return {"status": "ok"}
 
     @app.post("/push_update_atomic")

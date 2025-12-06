@@ -13,7 +13,7 @@ from torch.distributed.fsdp import (
     FullStateDictConfig,
 )
 
-from ludic.inference.client import ChatClient
+from ludic.distributed.interfaces import PolicyPublisher
 from ludic.training.algorithm import RLAlgorithm
 from ludic.training.config import TrainerConfig
 from ludic.training.types import SAWBatch, SAWItem, BatchSource
@@ -102,7 +102,7 @@ class Trainer:
           ↓
         optimizer.zero_grad()  # <-- Grads freed
           ↓
-        client.push_policy_update(...)     # <-- Sync
+        publisher.publish(...)     # <-- Sync
 
     Trainer is agnostic to envs, contexts, rollouts, and tokenization.
 
@@ -123,7 +123,7 @@ class Trainer:
         model: nn.Module,
         algo: RLAlgorithm,
         batch_source: BatchSource,
-        client: ChatClient,
+        publisher: PolicyPublisher,
         cfg: TrainerConfig = TrainerConfig(),
         param_filter: Optional[Callable[[str, Tensor], bool]] = None,
     ) -> None:
@@ -141,9 +141,8 @@ class Trainer:
                 Any object implementing BatchSource.next_batch() -> SAWBatch.
                 This is where rollouts, replay, branching, curricula live.
 
-            client:
-                A ChatClient (e.g., VLLMChatClient) used for pushing
-                updated weights into the runtime.
+            publisher:
+                Abstract interface to push weights to inference workers.
 
             cfg:
                 TrainerConfig for device, optimizer hyperparams, pad_token_id,
@@ -162,7 +161,7 @@ class Trainer:
         self.model = model.to(cfg.model_device) if not isinstance(model, FSDP) else model  # type: ignore[arg-type]
 
         self.algo = algo
-        self.client = client
+        self.publisher = publisher
         self._batch_source = batch_source
         self.sync_every_steps = self.cfg.sync_every_steps
         self.param_filter = param_filter
@@ -398,11 +397,7 @@ class Trainer:
 
     def _push_weights_to_runtime(self) -> None:
         """
-        Push updated policy parameters into the serving runtime via Client.
-
-        Requires that `client` implements:
-
-            def push_update_atomic(self, params: Mapping[str, Tensor], ...) -> str
+        Gather weights (handling FSDP if needed) and publish them.
 
         FSDP-aware behavior:
 
@@ -420,12 +415,6 @@ class Trainer:
         and will use NCCL from there. If you care, set cfg.runtime_device
         accordingly.
         """
-        if not hasattr(self.client, "push_update_atomic"):
-            raise RuntimeError(
-                "ChatClient does not support policy weight updates "
-                "(missing push_update_atomic)."
-            )
-
         # Only rank 0 talks to the runtime in distributed mode
         if dist.is_available() and dist.is_initialized():
             if dist.get_rank() != 0:
@@ -453,12 +442,14 @@ class Trainer:
             for name, tensor in full_state.items():
                 if self.param_filter is not None and not self.param_filter(name, tensor):
                     continue
+                # Important: The publisher handles the network transport,
+                # but we ensure tensors are on the correct device/detached first.
                 params[name] = tensor.detach().to(runtime_device)
 
             if not params:
                 return
 
-            self.client.push_update_atomic(params)
+            self.publisher.publish(params)
             return
 
         # ---------------- non-FSDP path ----------------
@@ -476,5 +467,4 @@ class Trainer:
         if not params:
             return
 
-        # Delegate to Client
-        self.client.push_update_atomic(params)
+        self.publisher.publish(params)
