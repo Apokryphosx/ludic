@@ -401,8 +401,8 @@ async def test_generate_batch_uses_model_token_ids_when_available(
     )
 
     # Single rollout, single step
-    assert batch.meta["batch_size"] == 1
-    assert batch.meta["total_items"] == 1
+    assert batch.meta["num_rollouts"] == 1
+    assert batch.meta["num_samples"] == 1
     # Env gives +1 reward when guess is correct
     assert batch.meta["avg_total_reward"] == pytest.approx(1.0)
 
@@ -492,8 +492,8 @@ async def test_generate_batch_retokenize_path_uses_custom_tokenizer(
         tokenize=fake_tokenize,
     )
 
-    assert batch.meta["batch_size"] == 1
-    assert batch.meta["total_items"] == 1
+    assert batch.meta["num_rollouts"] == 1
+    assert batch.meta["num_samples"] == 1
     assert batch.meta["avg_total_reward"] == pytest.approx(1.0)
 
     assert len(batch.items) == 1
@@ -562,11 +562,11 @@ async def test_rollout_batch_source_next_batch_integration(
     saw_batch = await batch_source.next_batch()
 
     # We asked for num_episodes=2 => 2 rollouts; each should have at least 1 step
-    assert saw_batch.meta["batch_size"] == 2
-    assert saw_batch.meta["total_items"] >= 2
+    assert saw_batch.meta["num_rollouts"] == 2
+    assert saw_batch.meta["num_samples"] >= 2
 
     # All items should carry rollout metadata including request_meta
-    assert len(saw_batch.items) == saw_batch.meta["total_items"]
+    assert len(saw_batch.items) == saw_batch.meta["num_samples"]
     for item in saw_batch.items:
         assert item.meta.get("request_meta", {}).get("batch_source") is True
         assert "rollout_id" in item.meta

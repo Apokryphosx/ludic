@@ -22,7 +22,7 @@ import signal
 import subprocess
 import sys
 import time
-from typing import List, Sequence
+from typing import List, Sequence, Dict
 
 import requests
 
@@ -33,6 +33,7 @@ from ludic.interaction.single_agent import SingleAgentSyncProtocol
 from ludic.parsers import ParseResult, cot_prefix_parser
 from ludic.types import SamplingArgs
 from environments.gsm8k import GSM8KEnv
+from ludic.training.stats import Reducer, apply_reducers_to_records
 
 
 def load_gsm8k(split: str, limit: int | None) -> List[dict]:
@@ -69,26 +70,6 @@ def optional_cot_parser(raw: str) -> ParseResult:
     if result.action is None:
         return ParseResult(action=raw.strip(), reward=0.0, obs=None)
     return result
-
-
-def _build_verifier():
-    """
-    Returns (verifier_fn, using_math_verify_flag).
-    Requires math-verify; raises if missing.
-    """
-    try:
-        from math_verify import verify as math_verify  # type: ignore
-    except Exception as e:
-        raise SystemExit(
-            "math-verify is required for this script. "
-            "Install with: uv pip install math-verify"
-        ) from e
-
-    def _verify(pred: str, target: str) -> bool:
-        result = math_verify(pred, target)
-        return bool(result)
-
-    return _verify, True
 
 
 def start_vllm_server(model: str, host: str, port: int) -> subprocess.Popen:
@@ -167,7 +148,12 @@ async def eval_dataset(
     timeout_s: float | None,
     concurrency: int = 1,
 ) -> List[dict]:
-    verifier, _ = _build_verifier()
+    reducers: Dict[str, Reducer] = {
+        "correct_rate": Reducer(kind="count_true", source="correct", normalize_by="samples"),
+        "parse_err_rate": Reducer(kind="count_true", source="parse_error", normalize_by="samples"),
+        "avg_completion_length": Reducer(kind="mean", source="completion_length"),
+        "total_completion_tokens": Reducer(kind="sum", source="completion_length"),
+    }
 
     client = VLLMChatClient(
         host=host,
@@ -219,6 +205,8 @@ async def eval_dataset(
             if info.get("parse_error") or step.truncated:
                 parse_errors += 1
 
+            completion_ids = info.get("completion_token_ids") or []
+
             records.append(
                 {
                     "question_id": info.get("question_id"),
@@ -228,9 +216,11 @@ async def eval_dataset(
                     "parsed_answer": info.get("parsed_answer"),
                     "target_answer": info.get("target_answer"),
                     "correct": info.get("correct"),
+                    "parse_error": info.get("parse_error"),
                     "reward": step.reward,
                     "truncated": step.truncated,
                     "terminated": step.terminated,
+                    "completion_length": len(completion_ids) if isinstance(completion_ids, list) else 0,
                 }
             )
 
@@ -243,6 +233,11 @@ async def eval_dataset(
     print(f"Correct       : {correct}")
     print(f"Accuracy      : {accuracy:.2f}%")
     print(f"Parse errors  : {parse_errors}")
+    reducer_stats = apply_reducers_to_records(records, reducers)
+    if reducer_stats:
+        print("Reducer stats :")
+        for k, v in reducer_stats.items():
+            print(f"  {k}: {v}")
     return records
 
 

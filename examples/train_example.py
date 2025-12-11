@@ -26,9 +26,11 @@ from ludic.training.types import EnvSpec, ProtocolSpec, RolloutRequest
 from ludic.training.algorithm import make_reinforce
 from ludic.training.trainer import Trainer
 from ludic.training.config import TrainerConfig
+from ludic.training.stats import Reducer
+from ludic.training.loggers import PrintLogger
 from ludic.interaction.single_agent import SingleAgentSyncProtocol
 from ludic.distributed.adapters import create_vllm_publisher
-from examples.envs.tic_tac_toe import TicTacToeEnv
+from environments.tic_tac_toe import TicTacToeEnv
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -96,10 +98,10 @@ def create_dashboard(stats: dict, step: int, total_steps: int) -> Table:
     table.add_row("🤝 Draw Rate", f"{draw:.1%}", "")
 
     # 4. Tech Stats
-    items = int(stats.get('batch_items', 0))
-    bs = int(stats.get('batch_size', 0))
+    items = int(stats.get('num_samples', 0))
+    bs = int(stats.get('num_rollouts', 0))
     table.add_section()
-    table.add_row("📦 Batch Size", f"{bs} eps / {items} steps", "")
+    table.add_row("📦 Batch Size", f"{bs} rollouts / {items} samples", "")
 
     return table
 
@@ -235,6 +237,32 @@ def main():
 
     # 7. Trainer
     # Uses the updated 'Trainer' which detects PEFT models and handles merging.
+    reducers = {
+        "illegal_rate": Reducer(
+            kind="count_true",
+            source="illegal_move",
+            normalize_by="samples",
+        ),
+        "win_rate": Reducer(
+            kind="count_true",
+            source="result",
+            transform=lambda v: v == "win",
+            normalize_by="rollouts",
+        ),
+        "loss_rate": Reducer(
+            kind="count_true",
+            source="result",
+            transform=lambda v: v == "loss",
+            normalize_by="rollouts",
+        ),
+        "draw_rate": Reducer(
+            kind="count_true",
+            source="result",
+            transform=lambda v: v == "draw",
+            normalize_by="rollouts",
+        ),
+    }
+
     trainer = Trainer(
         model=model,
         algo=make_reinforce(gamma=0.99),
@@ -246,7 +274,9 @@ def main():
             lr=LEARNING_RATE, 
             grad_accum_steps=4,  # Increase accum steps for 7B to stabilize gradients
             sync_every_steps=1
-        )
+        ),
+        train_logger=PrintLogger(prefix="[tictactoe]"),
+        reducers=reducers,
     )
 
     # 8. Run with Live Dashboard

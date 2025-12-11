@@ -42,6 +42,8 @@ from ludic.training.trainer import Trainer
 from ludic.training.config import TrainerConfig
 from ludic.training.checkpoint import CheckpointConfig
 from ludic.training.types import EnvSpec, ProtocolSpec, RolloutRequest
+from ludic.training.stats import Reducer
+from ludic.training.loggers import PrintLogger
 from rich.console import Console
 from rich.table import Table
 
@@ -227,6 +229,23 @@ def main():
         max_to_keep=2,
         save_optimizer=True,
     )
+    reducers = {
+        "correct_rate": Reducer(
+            kind="count_true",
+            source="correct",
+            normalize_by="rollouts",
+        ),
+        "parse_err_rate": Reducer(
+            kind="count_true",
+            source="parse_error",
+            normalize_by="samples",
+        ),
+        "total_completion_tokens": Reducer(
+            kind="sum",
+            source="completion_length",
+        ),
+    }
+
     trainer = Trainer(
         model=model,
         algo=algo,
@@ -234,6 +253,8 @@ def main():
         publisher=publisher,
         cfg=cfg,
         checkpoint_config=checkpoint_cfg,
+        train_logger=PrintLogger(prefix="[gsm8k]"),
+        reducers=reducers,
     )
 
     console = Console()

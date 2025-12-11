@@ -4,7 +4,7 @@ import pytest
 from ludic.context.full_dialog import FullDialog
 from ludic.interaction.single_agent import SingleAgentSyncProtocol
 from ludic.interaction.multi_agent import MultiAgentProtocol
-from ludic.agent import Agent
+from ludic.agents.base_agent import Agent
 from ludic.inference.client import ChatResponse
 from ludic.parsers import (
     cot_prefix_parser,

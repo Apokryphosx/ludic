@@ -47,7 +47,7 @@ def create_dashboard(stats: dict, step: int) -> Table:
     table.add_row("⚠️ Illegal Moves", f"{sem_err:.1%}")
     
     # Throughput
-    table.add_row("📦 Batch Size", f"{stats.get('batch_size', 0)}")
+    table.add_row("📦 Batch Size", f"{stats.get('num_rollouts', 0)} rollouts / {stats.get('num_samples', 0)} samples")
     return table
 
 def main():

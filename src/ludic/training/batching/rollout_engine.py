@@ -277,7 +277,8 @@ class RolloutEngine:
                     input_ids = list(prompt_ids) + list(completion_ids)
                     attention_mask = [1] * len(input_ids)
                     action_mask = [0] * len(prompt_ids) + [1] * len(completion_ids)
-                    completion_lengths.append(len(completion_ids))
+                    comp_len = len(completion_ids)
+                    completion_lengths.append(comp_len)
 
                     items.append(
                         SAWItem(
@@ -292,6 +293,7 @@ class RolloutEngine:
                                 "prev_obs": step.prev_obs,
                                 "action": step.action,
                                 "total_reward": r.total_reward,
+                                "completion_length": comp_len,
                                 **(r.meta),  # Rollout-level meta
                                 **(step.info),  # Step-level info
                             },
@@ -313,7 +315,8 @@ class RolloutEngine:
 
                 state_ids = tokenize(state_text)  # type: ignore[arg-type]
                 action_ids = tokenize(action_text)  # type: ignore[arg-type]
-                completion_lengths.append(len(action_ids))
+                comp_len = len(action_ids)
+                completion_lengths.append(comp_len)
 
                 input_ids = state_ids + action_ids
                 attention_mask = [1] * len(input_ids)
@@ -329,20 +332,21 @@ class RolloutEngine:
                             "rollout_id": r.id,
                             "step_index": step.index,
                             "reward": step.reward,
-                            "prev_obs": step.prev_obs,
-                            "action": step.action,
-                            "total_reward": r.total_reward,
-                            **(r.meta),  # Rollout-level meta
-                            **(step.info),  # Step-level info
-                        },
+                                "prev_obs": step.prev_obs,
+                                "action": step.action,
+                                "total_reward": r.total_reward,
+                                "completion_length": comp_len,
+                                **(r.meta),  # Rollout-level meta
+                                **(step.info),  # Step-level info
+                            },
+                        )
                     )
-                )
 
         # ---- Build batch-level metadata -----------------------------------
-        # Note: batch_size now reflects total number of *agent trajectories*, not global episodes.
+        # Note: num_rollouts reflects total number of *agent trajectories*, not global env episodes.
         meta = {
-            "batch_size": len(rollouts),
-            "total_items": len(items),
+            "num_rollouts": len(rollouts),
+            "num_samples": len(items),
             "avg_total_reward": (
                 float(sum(r.total_reward for r in rollouts) / len(rollouts))
                 if rollouts else 0.0

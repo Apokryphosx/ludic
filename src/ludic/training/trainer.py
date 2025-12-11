@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import logging
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Mapping
 
 import torch
 from torch import nn, optim, Tensor
@@ -18,7 +18,9 @@ from torch.distributed.fsdp import (
 from ludic.distributed.interfaces import PolicyPublisher
 from ludic.training.checkpoint import CheckpointConfig, CheckpointManager
 from ludic.training.algorithm import RLAlgorithm
+from ludic.training.loggers import TrainingLogger
 from ludic.training.config import TrainerConfig
+from ludic.training.stats import aggregate_stats, Reducer
 from ludic.training.types import SAWBatch, SAWItem, BatchSource
 
 logger = logging.getLogger(__name__)
@@ -134,6 +136,8 @@ class Trainer:
         checkpointer: Optional[CheckpointManager] = None,
         checkpoint_config: Optional[CheckpointConfig] = None,
         resume_from: Optional[int | str] = None,
+        train_logger: Optional[TrainingLogger] = None,
+        reducers: Optional[Mapping[str, Reducer]] = None,
     ) -> None:
         """
         Args:
@@ -177,8 +181,18 @@ class Trainer:
                 Optional checkpoint to load on startup. Accepts a step number
                 or an explicit checkpoint directory path. Requires a
                 checkpointer (explicit or via checkpoint_config).
+
+            train_logger:
+                Optional stats logger (e.g., PrintLogger, WandbLogger). Called
+                once per train_step with (step, stats).
+
+            reducers:
+                Optional aggregation reducers passed to aggregate_stats to
+                compute custom metrics from SAWItem meta.
         """
         self.cfg = cfg
+        self.train_logger = train_logger
+        self.reducers = reducers
 
         # Assume caller has already done any FSDP wrapping / device placement.
         # We do NOT unconditionally .to(device) for FSDP; that’s the caller’s job.
@@ -398,7 +412,7 @@ class Trainer:
             self._push_weights_to_runtime()
 
         # ---- 6) Enrich stats -------------------------------------------
-        final_stats = self._aggregate_stats(all_micro_stats, all_saw_batches)
+        final_stats = aggregate_stats(all_micro_stats, all_saw_batches, reducers=self.reducers)
         final_stats["train_step"] = float(self._train_step_idx)
 
         # ---- 7) Optional Checkpoint ------------------------------------
@@ -410,86 +424,14 @@ class Trainer:
                 metadata={"algorithm": self.algo.name},
             )
 
+        # ---- 8) Optional logging ---------------------------------------
+        if self.train_logger is not None:
+            try:
+                self.train_logger.log(self._train_step_idx, final_stats)
+            except Exception:
+                logger.exception("Stats logger failed at step %s", self._train_step_idx)
+
         return final_stats
-
-    def _aggregate_stats(
-        self,
-        micro_stats_list: List[Dict[str, float]],
-        saw_batches: List[SAWBatch],
-    ) -> Dict[str, float]:
-        """
-        Aggregate stats, including custom metrics from item metadata.
-        """
-        if not micro_stats_list:
-            return {}
-
-        # 1. Standard Loss/Grad Stats
-        agg_stats: Dict[str, float] = {k: 0.0 for k in micro_stats_list[0].keys()}
-        num_micro_batches = len(micro_stats_list)
-
-        for micro_stats in micro_stats_list:
-            for k, v in micro_stats.items():
-                if k in agg_stats:
-                    agg_stats[k] += v
-
-        for k in agg_stats:
-            agg_stats[k] /= num_micro_batches
-
-        # 2. Batch Metadata Stats (Reward, Size)
-        total_items = 0.0
-        total_episodes = 0.0
-        total_reward_sum = 0.0 
-
-        # 3. Custom Counters (Syntax, Semantics, Outcomes)
-        counts = {"syntax_err": 0.0, "semantic_err": 0.0, "win": 0.0, "loss": 0.0, "draw": 0.0}
-
-        for batch in saw_batches:
-            num_items = float(len(batch.items))
-            total_items += num_items
-            
-            # Each batch has N episodes
-            batch_eps = float(batch.meta.get("batch_size", 0.0))
-            total_episodes += batch_eps
-            
-            # Weighted reward average
-            avg_reward = float(batch.meta.get("avg_total_reward", 0.0))
-            total_reward_sum += avg_reward * num_items
-
-            # Scan items for specific flags set by Agent/Env
-            for item in batch.items:
-                # Syntax Error (Agent output invalid XML)
-                if item.meta.get("parse_error"):
-                    counts["syntax_err"] += 1.0
-                
-                # Semantic Error (Agent output valid XML but invalid move)
-                if item.meta.get("illegal_move"):
-                    counts["semantic_err"] += 1.0
-                
-                # Outcomes (usually only present on the final step)
-                res = item.meta.get("result") # "win", "loss", "draw"
-                if res in counts:
-                    counts[res] += 1.0
-
-        agg_stats["batch_items"] = total_items
-        agg_stats["batch_size"] = total_episodes
-
-        if total_items > 0:
-            agg_stats["avg_total_reward"] = total_reward_sum / total_items
-            # Error rates are per step (decision)
-            agg_stats["err_syntax"] = counts["syntax_err"] / total_items
-            agg_stats["err_semantic"] = counts["semantic_err"] / total_items
-        else:
-            agg_stats["avg_total_reward"] = 0.0
-            agg_stats["err_syntax"] = 0.0
-            agg_stats["err_semantic"] = 0.0
-
-        if total_episodes > 0:
-            # Outcome rates are per episode
-            agg_stats["rate_win"] = counts["win"] / total_episodes
-            agg_stats["rate_loss"] = counts["loss"] / total_episodes
-            agg_stats["rate_draw"] = counts["draw"] / total_episodes
-
-        return agg_stats
 
     # ------------------------------------------------------------------
     # Sync wrappers for non-async callers

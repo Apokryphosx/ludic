@@ -73,7 +73,8 @@ class PipelineBatchSource(BatchSource):
             avg_reward = total_r / len(items)
 
         meta = {
-            "batch_size": len(items),
+            "num_rollouts": len(items),
+            "num_samples": len(items),
             "avg_total_reward": avg_reward,
             "source": "pipeline_redis"
         }
