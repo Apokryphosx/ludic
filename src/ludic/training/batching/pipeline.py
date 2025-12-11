@@ -3,7 +3,6 @@ from __future__ import annotations
 import pickle
 import logging
 import asyncio
-import redis
 from typing import List, Callable, Optional
 from dataclasses import replace
 
@@ -35,6 +34,11 @@ class PipelineBatchSource(BatchSource):
         batch_size: int = 4,
         poll_timeout: int = 1
     ):
+        try:
+            import redis  # type: ignore
+        except ImportError as exc:
+            raise ImportError("PipelineBatchSource requires the 'redis' package. Install with: uv pip install redis") from exc
+
         self.r = redis.from_url(redis_url)
         self.queue_key = queue_key
         self.batch_size = batch_size
@@ -106,6 +110,11 @@ async def run_pipeline_actor(
     4. Delegate generation AND collation to the shared Engine.
     5. Push the resulting SAWItems to Redis.
     """
+    try:
+        import redis  # type: ignore
+    except ImportError as exc:
+        raise ImportError("run_pipeline_actor requires the 'redis' package. Install with: uv pip install redis") from exc
+
     r_conn = redis.from_url(redis_url)
     logger.info(f"Pipeline Actor connected to Redis at {redis_url}")
     
