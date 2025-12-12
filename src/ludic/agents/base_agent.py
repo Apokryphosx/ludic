@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple, Mapping
 
 import torch
 
-from ludic.types import SamplingArgs, Observation, Info, Message
+from ludic.types import SamplingArgs, Observation, Info, Message, ChatResponse
 from ludic.inference.client import ChatClient
 from ludic.inference.sampling import SamplingConfig, resolve_sampling_args
 from ludic.context.base import ContextStrategy
@@ -42,6 +42,39 @@ class Agent:
         self._parser = parser
         self.last_info: Dict[str, Any] = {}
 
+    async def _infer_once(
+        self,
+        *,
+        messages: List[Message],
+        sampling_args: SamplingArgs,
+        timeout_s: Optional[float] = None,
+    ) -> Tuple[ChatResponse, Dict[str, Any], Dict[str, Any]]:
+        """
+        Shared single inference helper.
+
+        Resolves sampling args, runs the client call (optionally with timeout),
+        merges token IDs into the returned info dict, and updates self.last_info.
+        """
+        sampling: SamplingConfig = resolve_sampling_args(sampling_args)
+        coro = self._client.complete(
+            model=self._model,
+            messages=messages,
+            sampling=sampling,
+        )
+        if timeout_s is None:
+            resp, client_info = await coro
+        else:
+            resp, client_info = await asyncio.wait_for(coro, timeout=timeout_s)
+
+        last_info: Dict[str, Any] = dict(client_info)
+        if resp.prompt_token_ids is not None:
+            last_info["prompt_token_ids"] = resp.prompt_token_ids
+        if resp.completion_token_ids is not None:
+            last_info["completion_token_ids"] = resp.completion_token_ids
+
+        self.last_info = last_info
+        return resp, client_info, last_info
+
     def reset(self, system_prompt: Optional[str] = None) -> None:
         """Resets the agent's internal context."""
         self._ctx.reset(system_prompt=system_prompt)
@@ -74,26 +107,13 @@ class Agent:
         """
         # 1. Think (prepare prompt messages from context)
         messages: List[Message] = self._ctx.on_before_act()
-        
-        # 2. Act (run inference)
-        sampling: SamplingConfig = resolve_sampling_args(sampling_args)
-        coro = self._client.complete(
-            model=self._model,
-            messages=messages,
-            sampling=sampling,
-        )
-        if timeout_s is None:
-            resp, client_info = await coro
-        else:
-            resp, client_info = await asyncio.wait_for(coro, timeout=timeout_s)
 
-        self.last_info = dict(client_info)
-        
-        # Also merge token IDs from the response if they exist
-        if resp.prompt_token_ids is not None:
-            self.last_info["prompt_token_ids"] = resp.prompt_token_ids
-        if resp.completion_token_ids is not None:
-            self.last_info["completion_token_ids"] = resp.completion_token_ids
+        # 2. Act (run inference)
+        resp, _client_info, last_info = await self._infer_once(
+            messages=messages,
+            sampling_args=sampling_args,
+            timeout_s=timeout_s,
+        )
         
         # 3. Update memory with the agent's own response
         self._ctx.on_after_act(resp)
@@ -102,7 +122,7 @@ class Agent:
         raw_action = resp.text
         parse_result = self._parser(raw_action)
         
-        return parse_result, raw_action, self.last_info
+        return parse_result, raw_action, last_info
 
     def push_policy_update(
         self,
