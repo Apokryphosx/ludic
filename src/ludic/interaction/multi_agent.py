@@ -130,8 +130,9 @@ class MultiAgentProtocol(InteractionProtocol):
             # --- D. Step the environment ---
             # actions_to_take only contains VALID actions from managed agents.
             # Invalid ones are excluded here but handled below via parser_failures.
-            env_outcomes = env.step(actions_to_take)
-
+            env_outcomes: Dict[str, StepOutcome] = {}
+            if actions_to_take:
+                env_outcomes = env.step(actions_to_take)
             # --- E. Process Results & Log Steps ---
             any_term = False
             any_trunc = False
