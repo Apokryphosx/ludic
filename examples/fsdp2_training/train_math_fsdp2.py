@@ -1,10 +1,10 @@
 """
-FSDP2 GSM8K training scaffold (3 training GPUs + 1 VLLM GPU).
+FSDP2 MATH training scaffold (3 training GPUs + 1 vLLM GPU).
 
 Assumptions:
-  - GPU0 runs VLLM serving Qwen2.5-7B-Instruct.
+  - GPU0 runs vLLM serving Qwen2.5-7B-Instruct.
   - GPUs 1-3 are reserved for training (set CUDA_VISIBLE_DEVICES=1,2,3).
-  - Launch with torchrun: torchrun --nproc_per_node=3 examples/fsdp2_training/train_gsm8k_fsdp2.py
+  - Launch with torchrun: torchrun --nproc_per_node=3 examples/fsdp2_training/train_math_fsdp2.py
 
 This is a skeleton to illustrate FSDP2 wrapping + Ludic trainer wiring.
 Tune batch sizes, steps, and sampling to your hardware.
@@ -26,13 +26,13 @@ from torch.distributed import fsdp
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset  # type: ignore
 
-from environments.gsm8k import GSM8KEnv
+from environments.math import MATHEnv
 from ludic.agents.base_agent import Agent
 from ludic.context.full_dialog import FullDialog
 from ludic.distributed.adapters import create_vllm_publisher
 from ludic.inference.vllm_client import VLLMChatClient
 from ludic.interaction.single_agent import SingleAgentSyncProtocol
-from ludic.parsers import boxed_parser
+from ludic.parsers import boxed_parser, compose_parsers, cot_prefix_parser, extract_last_boxed_content
 from ludic.training.algorithm import RLAlgorithm
 from ludic.training.batching.rollout_engine import RolloutEngine
 from ludic.training.batching.synced_batching import RolloutBatchSource
@@ -61,6 +61,7 @@ async def run_eval(
     concurrency: int,
     max_tokens: int,
     temperature: float,
+    parser,
 ) -> float:
     """
     Simple eval loop: run each sample once and report accuracy (% correct).
@@ -69,13 +70,13 @@ async def run_eval(
 
     async def _run_one(sample: Dict[str, Any]) -> bool:
         async with sem:
-            env = GSM8KEnv(sample=sample, system_prompt=system_prompt)
+            env = MATHEnv(sample=sample, system_prompt=system_prompt)
             protocol = SingleAgentSyncProtocol(
                 agent=Agent(
                     client=client,
                     model=model,
                     ctx=FullDialog(),
-                    parser=boxed_parser,
+                    parser=parser,
                 )
             )
             rollouts = await protocol.run(
@@ -98,9 +99,9 @@ def configure_logging(*, rank: int, level: str) -> None:
         format=f"%(asctime)s [rank{rank}] %(levelname)s %(name)s: %(message)s",
         force=True,
     )
-    # Keep very chatty libraries quieter by default.
     for noisy in ("urllib3", "aiohttp", "httpx", "openai", "datasets", "transformers"):
         logging.getLogger(noisy).setLevel(max(numeric, logging.WARNING))
+
 
 def silence_nonzero_ranks(*, rank: int) -> None:
     if rank == 0:
@@ -108,7 +109,7 @@ def silence_nonzero_ranks(*, rank: int) -> None:
     logging.getLogger().setLevel(logging.ERROR)
     for noisy in ("urllib3", "aiohttp", "httpx", "openai", "datasets", "transformers"):
         logging.getLogger(noisy).setLevel(logging.ERROR)
-    sys.stdout = open(os.devnull, "w")  # noqa: SIM115
+    sys.stdout = open(os.devnull, "w")
 
 
 def init_dist(*, local_rank: int) -> int:
@@ -134,17 +135,66 @@ def shard_samples(samples: List[Dict[str, Any]], rank: int, world_size: int) -> 
     return [s for i, s in enumerate(samples) if i % world_size == rank]
 
 
-def load_gsm8k(split: str, limit: int | None) -> List[Dict[str, Any]]:
-    ds = load_dataset("gsm8k", "main", split=split)
+MATH_TRAIN_DATASET = "qwedsacf/competition_math"
+MATH_EVAL_DATASET = "HuggingFaceH4/MATH-500"
+
+
+def _load_dataset_split(dataset: str, split: str):
+    """
+    Load an HF dataset split without fallback.
+    """
+    try:
+        return load_dataset(dataset, split=split)
+    except Exception as e:
+        raise SystemExit(f"Could not load dataset={dataset!r} split={split!r}: {e}") from e
+
+
+def load_math_train(limit: int | None) -> List[Dict[str, Any]]:
+    ds = load_dataset(MATH_TRAIN_DATASET, split="train")
     samples: List[Dict[str, Any]] = []
     for idx, row in enumerate(ds):
+        problem = row.get("problem")
+        solution = row.get("solution")
+        if problem is None:
+            raise SystemExit(f"{MATH_TRAIN_DATASET} sample is missing 'problem' at index={idx}")
+        if solution is None:
+            raise SystemExit(f"{MATH_TRAIN_DATASET} sample is missing 'solution' at index={idx}")
         samples.append(
             {
-                "question": row["question"],
-                "answer": row["answer"],
+                "problem": str(problem),
+                "solution": str(solution),
                 "id": row.get("id", idx),
+                "level": row.get("level"),
+                "type": row.get("type"),
             }
         )
+        if limit is not None and len(samples) >= limit:
+            break
+    return samples
+
+
+def load_math_eval(limit: int | None) -> List[Dict[str, Any]]:
+    ds = _load_dataset_split(MATH_EVAL_DATASET, split="test")
+    samples: List[Dict[str, Any]] = []
+    for idx, row in enumerate(ds):
+        solution = row.get("solution")
+        problem = row.get("problem")
+        sample: Dict[str, Any] = {
+            "problem": str(problem) if problem is not None else "",
+            "id": row.get("id", idx),
+            "level": row.get("level"),
+            "type": row.get("type"),
+        }
+        if problem is None:
+            raise SystemExit(f"{MATH_EVAL_DATASET} sample is missing 'problem' at index={idx}")
+        if solution is None:
+            raise SystemExit(f"{MATH_EVAL_DATASET} sample is missing 'solution' at index={idx}")
+        if extract_last_boxed_content(str(solution)) is None:
+            raise SystemExit(
+                f"{MATH_EVAL_DATASET} sample at index={idx} does not contain a final \\\\boxed{{...}} answer"
+            )
+        sample["solution"] = str(solution)
+        samples.append(sample)
         if limit is not None and len(samples) >= limit:
             break
     return samples
@@ -156,7 +206,7 @@ def build_requests_fn(
     sampling_args: Dict[str, Any],
     *,
     group_size: int,
-) -> callable:
+):
     def _fn() -> List[RolloutRequest]:
         reqs: List[RolloutRequest] = []
         for _ in range(batch_size):
@@ -165,7 +215,7 @@ def build_requests_fn(
             idx, sample = samples_q.get()
             reqs.append(
                 RolloutRequest(
-                    env=EnvSpec(kind="gsm8k", kwargs={"sample": sample}),
+                    env=EnvSpec(kind="math", kwargs={"sample": sample}),
                     protocol=ProtocolSpec(kind="single_agent", kwargs={}),
                     num_episodes=1,
                     seed=int(idx),
@@ -185,22 +235,30 @@ def main() -> None:
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--vllm-host", default="127.0.0.1")
     parser.add_argument("--vllm-port", type=int, default=8000)
-    parser.add_argument("--split", default="train")
     parser.add_argument("--limit", type=int, default=2048)
     parser.add_argument("--train-steps", type=int, default=50)
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--concurrency", type=int, default=12)
+    parser.add_argument("--concurrency", type=int, default=11)
     parser.add_argument("--train-temperature", type=float, default=1.0)
-    parser.add_argument("--system-prompt", type=str, default="")
-    parser.add_argument("--rollout-log", type=str, default="fsdp2_gsm8k_rollouts.jsonl")
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_gsm8k_fsdp2")
+    parser.add_argument(
+        "--system-prompt",
+        type=str,
+        default="You are a careful math tutor. Think in <think></think> and put your final answer in \\\\boxed{...}.",
+    )
+    parser.add_argument("--rollout-log", type=str, default="fsdp2_math_rollouts.jsonl")
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_math_fsdp2")
     parser.add_argument("--eval-every", type=int, default=10, help="Eval every N train steps (0 disables).")
     parser.add_argument("--eval-before-start", action="store_true", default=False, help="Run eval once at step 0.")
     parser.add_argument("--eval-limit", type=int, default=100, help="Number of test samples for eval (0 disables).")
     parser.add_argument("--eval-concurrency", type=int, default=32)
     parser.add_argument("--eval-temperature", type=float, default=0.0)
-    parser.add_argument("--eval-max-tokens", type=int, default=512)
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=1024,
+        help="Max tokens per completion (train + eval).",
+    )
     parser.add_argument("--log-level", type=str, default="INFO")
     parser.add_argument("--logger", choices=["rich", "print", "none"], default="rich")
     parser.add_argument(
@@ -221,9 +279,7 @@ def main() -> None:
     device = torch.device(f"cuda:{env_local_rank}" if torch.cuda.is_available() else "cpu")
     torch.cuda.set_device(device)
 
-    # Avoid multiple ranks writing to the same file.
     rollout_log_path = args.rollout_log.replace(".jsonl", f".rank{rank}.jsonl")
-
     if rank == 0:
         os.makedirs(os.path.dirname(rollout_log_path) or ".", exist_ok=True)
         os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -233,7 +289,7 @@ def main() -> None:
     )
 
     # Data
-    all_train_samples = load_gsm8k(args.split, args.limit)
+    all_train_samples = load_math_train(args.limit)
     train_samples = shard_samples(all_train_samples, rank, world_size)
     if not train_samples:
         raise SystemExit(f"Rank {rank}: no samples after sharding.")
@@ -241,7 +297,7 @@ def main() -> None:
     do_eval = bool(args.eval_limit and args.eval_limit > 0)
     eval_samples: List[Dict[str, Any]] = []
     if rank == 0 and do_eval:
-        eval_samples = load_gsm8k("test", args.eval_limit)
+        eval_samples = load_math_eval(args.eval_limit)
 
     samples_q: queue.Queue = queue.Queue()
     for idx, s in enumerate(train_samples):
@@ -257,14 +313,12 @@ def main() -> None:
         reduce_dtype=torch.float32,
     )
 
-    # Load on CPU then fully_shard to training devices
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         dtype=torch.bfloat16,
         device_map={"": "cpu"},
         low_cpu_mem_usage=True,
     )
-    # Shard transformer blocks first (recommended) then shard the root model.
     blocks = None
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         blocks = model.model.layers  # type: ignore[attr-defined]
@@ -275,8 +329,9 @@ def main() -> None:
             fsdp.fully_shard(layer, mp_policy=mp_policy)
     fsdp.fully_shard(model, mp_policy=mp_policy)
 
-    # Shared client for inference
-    # Only rank0 should enable NCCL-based weight updates into vLLM.
+    action_parser = compose_parsers(cot_prefix_parser, boxed_parser)
+
+    # Shared client for inference (rank0 does weight updates)
     client = VLLMChatClient(
         host=args.vllm_host,
         port=args.vllm_port,
@@ -285,7 +340,7 @@ def main() -> None:
     )
     publisher = create_vllm_publisher(client) if rank == 0 else _NoopPublisher()
 
-    env_registry = {"gsm8k": lambda sample: GSM8KEnv(sample=sample, system_prompt=args.system_prompt)}
+    env_registry = {"math": lambda sample: MATHEnv(sample=sample, system_prompt=args.system_prompt)}
 
     def protocol_factory():
         return SingleAgentSyncProtocol(
@@ -293,7 +348,7 @@ def main() -> None:
                 client=client,
                 model=args.model,
                 ctx=FullDialog(),
-                parser=boxed_parser,
+                parser=action_parser,
             )
         )
 
@@ -312,7 +367,7 @@ def main() -> None:
     )
     sampling_args = {
         "temperature": args.train_temperature,
-        "max_tokens": 512,
+        "max_tokens": args.max_tokens,
         "extras": {"extra_body": {"return_token_ids": True}},
     }
     requests_fn = build_requests_fn(samples_q, args.batch_size, sampling_args, group_size=args.group_size)
@@ -405,15 +460,15 @@ def main() -> None:
                     model=args.model,
                     system_prompt=args.system_prompt,
                     concurrency=args.eval_concurrency,
-                    max_tokens=args.eval_max_tokens,
+                    max_tokens=args.max_tokens,
                     temperature=args.eval_temperature,
+                    parser=action_parser,
                 )
                 print(f"[eval @ step 0] accuracy={acc:.2f}% on {len(eval_samples)} samples", flush=True)
             if dist.is_initialized():
                 dist.barrier()
 
         for _ in range(args.train_steps):
-            # Stop all ranks if any rank runs out of samples to avoid deadlocks.
             local_done = 1 if samples_q.empty() else 0
             if dist.is_initialized():
                 done = torch.tensor(local_done, device=device)
@@ -444,8 +499,9 @@ def main() -> None:
                             model=args.model,
                             system_prompt=args.system_prompt,
                             concurrency=args.eval_concurrency,
-                            max_tokens=args.eval_max_tokens,
+                            max_tokens=args.max_tokens,
                             temperature=args.eval_temperature,
+                            parser=action_parser,
                         )
                         print(
                             f"[eval @ step {step}] accuracy={acc:.2f}% on {len(eval_samples)} samples",
