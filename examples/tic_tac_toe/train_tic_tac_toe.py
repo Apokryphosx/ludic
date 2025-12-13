@@ -156,6 +156,7 @@ def main():
     parser.add_argument("--log-memory", action="store_true", help="Log CPU/CUDA memory stats during training.")
     parser.add_argument("--log-memory-every", type=int, default=1, help="Log memory every N train steps (when --log-memory).")
     parser.add_argument("--log-memory-per-micro-step", action="store_true", help="Also log memory per micro-step (very verbose).")
+    parser.add_argument("--sync-every-steps", type=int, default=5, help="Push weights to runtime every N train steps.")
     args = parser.parse_args()
 
     if args.config:
@@ -186,6 +187,7 @@ def main():
                 "log_memory": ["--log-memory"],
                 "log_memory_every": ["--log-memory-every"],
                 "log_memory_per_micro_step": ["--log-memory-per-micro-step"],
+                "sync_every_steps": ["--sync-every-steps"],
             },
         )
 
@@ -290,6 +292,7 @@ def main():
         log_memory=bool(args.log_memory),
         log_memory_every_steps=max(1, int(args.log_memory_every)),
         log_memory_per_micro_step=bool(args.log_memory_per_micro_step),
+        sync_every_steps=max(1, int(args.sync_every_steps)),
     )
     checkpoint_cfg = CheckpointConfig(
         output_dir="checkpoints_tictactoe",
