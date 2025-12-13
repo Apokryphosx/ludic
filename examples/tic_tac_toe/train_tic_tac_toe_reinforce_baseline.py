@@ -1,0 +1,408 @@
+"""
+Minimal Tic-Tac-Toe training scaffold (REINFORCE + batch-mean baseline).
+
+This is a near-clone of `train_tic_tac_toe.py`, but swaps the GRPO-style
+group-normalized credit assignment for a standard REINFORCE baseline loss.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import os
+import queue
+from typing import Any, Dict, List
+
+import torch
+from peft import LoraConfig, TaskType, get_peft_model
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from config_utils import apply_config_to_args, load_toml, select_section
+from environments.tic_tac_toe import TicTacToeEnv
+from ludic.agents.base_agent import Agent
+from ludic.context.full_dialog import FullDialog
+from ludic.distributed.adapters import create_vllm_publisher
+from ludic.inference.vllm_client import VLLMChatClient
+from ludic.interaction.single_agent import SingleAgentSyncProtocol
+from ludic.parsers import compose_parsers, cot_prefix_parser, xml_move_parser
+from ludic.training.algorithm import RLAlgorithm
+from ludic.training.batching.rollout_engine import RolloutEngine
+from ludic.training.batching.synced_batching import RolloutBatchSource
+from ludic.training.checkpoint import CheckpointConfig
+from ludic.training.config import TrainerConfig
+from ludic.training.credit_assignment import MonteCarloReturn
+from ludic.training.loss import ReinforceBaselineLoss
+from ludic.training.loggers import RichLiveLogger
+from ludic.training.stats import Reducer
+from ludic.training.trainer import Trainer
+from ludic.training.types import EnvSpec, ProtocolSpec, RolloutRequest
+
+# Compose parsers to strip optional <think>...</think> and then require <move>...</move>.
+TICTACTOE_PARSER = compose_parsers(cot_prefix_parser, xml_move_parser)
+
+
+async def run_eval(
+    *,
+    seeds: List[int],
+    client: VLLMChatClient,
+    model: str,
+    concurrency: int,
+    max_tokens: int,
+    temperature: float,
+    max_steps: int,
+) -> float:
+    """
+    Run a batch of Tic-Tac-Toe episodes and report win rate (%).
+    """
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def _run_one(seed: int) -> bool:
+        async with sem:
+            env = TicTacToeEnv(agent_starts=True)
+            base_prompt = env.suggested_sysprompt or ""
+            sys_prompt = (
+                base_prompt
+                + "\n\nThink through the board in <think>...</think> and output your move as a single XML tag, e.g., <move>A1</move>."
+            )
+            protocol = SingleAgentSyncProtocol(
+                agent=Agent(
+                    client=client,
+                    model=model,
+                    ctx=FullDialog(),
+                    parser=TICTACTOE_PARSER,
+                ),
+                prompt=sys_prompt,
+            )
+            rollouts = await protocol.run(
+                env=env,
+                max_steps=max_steps,
+                seed=seed,
+                sampling_args={
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "extras": {"extra_body": {"return_token_ids": True}},
+                },
+            )
+            info = rollouts[0].steps[-1].info
+            return info.get("result") == "win"
+
+    results = await asyncio.gather(*[_run_one(s) for s in seeds])
+    wins = sum(1 for r in results if r)
+    return 100.0 * wins / len(seeds) if seeds else 0.0
+
+
+def build_requests_fn(
+    seeds_q: queue.Queue,
+    batch_size: int,
+    sampling_args: Dict[str, Any],
+):
+    def _fn() -> List[RolloutRequest]:
+        reqs: List[RolloutRequest] = []
+        for _ in range(batch_size):
+            if seeds_q.empty():
+                break
+            seed = seeds_q.get()
+            reqs.append(
+                RolloutRequest(
+                    env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": True}),
+                    protocol=ProtocolSpec(kind="single_agent", kwargs={}),
+                    num_episodes=1,
+                    seed=int(seed),
+                    sampling_args=sampling_args,
+                )
+            )
+        return reqs
+
+    return _fn
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Train a model on Tic-Tac-Toe using Ludic + vLLM (REINFORCE baseline)."
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional TOML config path (top-level + [train] section). CLI flags override config.",
+    )
+    parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--train-episodes", type=int, default=256, help="Total episodes to sample for training.")
+    parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=4, help="Rollout requests per batch source call.")
+    parser.add_argument("--train-steps", type=int, default=100)
+    parser.add_argument("--max-steps-per-episode", type=int, default=5)
+    parser.add_argument("--lora-rank", type=int, default=16)
+    parser.add_argument("--lora-alpha-mult", type=float, default=2.0)
+    parser.add_argument("--lora-dropout", type=float, default=0.0)
+    parser.add_argument("--train-temperature", type=float, default=1.0)
+    parser.add_argument("--eval-every", type=int, default=10)
+    parser.add_argument(
+        "--eval-before-start",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run eval once before training begins.",
+    )
+    parser.add_argument("--eval-episodes", type=int, default=200)
+    parser.add_argument("--eval-concurrency", type=int, default=32)
+    parser.add_argument("--eval-temperature", type=float, default=0.6)
+    parser.add_argument("--rollout-log", type=str, default="tictactoe_train_rollouts.jsonl")
+    parser.add_argument("--max-seq-len", type=int, default=0)
+    parser.add_argument("--log-memory", action="store_true")
+    parser.add_argument("--log-memory-every", type=int, default=1)
+    parser.add_argument("--log-memory-per-micro-step", action="store_true")
+    parser.add_argument("--sync-every-steps", type=int, default=5)
+    parser.add_argument(
+        "--baseline-normalize-advantages",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="If true, normalize advantages (zero mean / unit std) within the batch.",
+    )
+    args = parser.parse_args()
+
+    if args.config:
+        cfg = select_section(load_toml(args.config), "train")
+        args = apply_config_to_args(
+            args,
+            config=cfg,
+            option_strings_by_dest={
+                "model": ["--model"],
+                "host": ["--host"],
+                "port": ["--port"],
+                "train_episodes": ["--train-episodes"],
+                "concurrency": ["--concurrency"],
+                "batch_size": ["--batch-size"],
+                "train_steps": ["--train-steps"],
+                "max_steps_per_episode": ["--max-steps-per-episode"],
+                "lora_rank": ["--lora-rank"],
+                "lora_alpha_mult": ["--lora-alpha-mult"],
+                "lora_dropout": ["--lora-dropout"],
+                "train_temperature": ["--train-temperature"],
+                "eval_every": ["--eval-every"],
+                "eval_before_start": ["--eval-before-start", "--no-eval-before-start"],
+                "eval_episodes": ["--eval-episodes"],
+                "eval_concurrency": ["--eval-concurrency"],
+                "eval_temperature": ["--eval-temperature"],
+                "rollout_log": ["--rollout-log"],
+                "max_seq_len": ["--max-seq-len"],
+                "log_memory": ["--log-memory"],
+                "log_memory_every": ["--log-memory-every"],
+                "log_memory_per_micro_step": ["--log-memory-per-micro-step"],
+                "sync_every_steps": ["--sync-every-steps"],
+                "baseline_normalize_advantages": [
+                    "--baseline-normalize-advantages",
+                    "--no-baseline-normalize-advantages",
+                ],
+            },
+        )
+
+    if args.log_memory:
+        logging.basicConfig(level=logging.INFO)
+
+    rollout_log_path = os.path.abspath(args.rollout_log)
+    os.makedirs(os.path.dirname(rollout_log_path) or ".", exist_ok=True)
+    open(rollout_log_path, "a", encoding="utf-8").close()
+
+    # Seeds for deterministic episode resets
+    seeds_q: queue.Queue = queue.Queue()
+    for i in range(args.train_episodes):
+        seeds_q.put(i)
+
+    # Tokenizer + model
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    base_model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+    )
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=args.lora_rank,
+        lora_alpha=int(args.lora_rank * args.lora_alpha_mult),
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        target_modules="all-linear",
+    )
+    model = get_peft_model(base_model, lora_config)
+    model.to("cuda" if torch.cuda.is_available() else "cpu")
+    model.print_trainable_parameters()
+
+    # Shared client for inference
+    client = VLLMChatClient(host=args.host, port=args.port, enable_weight_updates=True)
+    publisher = create_vllm_publisher(client)
+
+    # Registries
+    env_registry = {"tictactoe": lambda agent_starts=True: TicTacToeEnv(agent_starts=agent_starts)}
+
+    def protocol_factory():
+        base_prompt = TicTacToeEnv().suggested_sysprompt or ""
+        prompt = (
+            base_prompt
+            + "\n\nThink through the board in <think>...</think> and output your move as a single XML tag, e.g., <move>A1</move>."
+        )
+        return SingleAgentSyncProtocol(
+            agent=Agent(
+                client=client,
+                model=args.model,
+                ctx=FullDialog(),
+                parser=TICTACTOE_PARSER,
+            ),
+            prompt=prompt,
+        )
+
+    protocol_registry = {"single_agent": protocol_factory}
+
+    # Algorithm: REINFORCE with batch-mean baseline (no GRPO grouping).
+    algo = RLAlgorithm(
+        name="reinforce_baseline",
+        credit_assigner=MonteCarloReturn(gamma=1.0),
+        loss=ReinforceBaselineLoss(
+            normalize=bool(args.baseline_normalize_advantages),
+            length_normalize=True,
+        ),
+    )
+
+    # Engine + batch source
+    engine = RolloutEngine(
+        env_registry=env_registry,
+        protocol_registry=protocol_registry,
+        jsonl_path=rollout_log_path,
+    )
+    sampling_args = {
+        "temperature": args.train_temperature,
+        "max_tokens": 250,
+        "extras": {"extra_body": {"return_token_ids": True}},
+    }
+    requests_fn = build_requests_fn(seeds_q, args.batch_size, sampling_args)
+    batch_source = RolloutBatchSource(
+        orchestrator=engine,
+        credit_assigner=algo.credit_assigner,
+        requests_fn=requests_fn,
+        max_steps=args.max_steps_per_episode,
+        concurrency=args.concurrency,
+        retokenize=False,
+    )
+
+    # Trainer
+    cfg = TrainerConfig(
+        model_device="cuda" if torch.cuda.is_available() else "cpu",
+        grad_accum_steps=4,
+        max_grad_norm=0.5,
+        pad_token_id=tokenizer.pad_token_id,
+        lr=5e-5,
+        max_seq_len=(args.max_seq_len if args.max_seq_len and args.max_seq_len > 0 else None),
+        log_memory=bool(args.log_memory),
+        log_memory_every_steps=max(1, int(args.log_memory_every)),
+        log_memory_per_micro_step=bool(args.log_memory_per_micro_step),
+        sync_every_steps=max(1, int(args.sync_every_steps)),
+    )
+    checkpoint_cfg = CheckpointConfig(
+        output_dir="checkpoints_tictactoe",
+        every_n_steps=25,
+        max_to_keep=2,
+        save_optimizer=True,
+    )
+    reducers = {
+        "win_rate": Reducer(
+            kind="count_true",
+            source="result",
+            transform=lambda v: v == "win",
+            normalize_by="rollouts",
+        ),
+        "loss_rate": Reducer(
+            kind="count_true",
+            source="result",
+            transform=lambda v: v == "loss",
+            normalize_by="rollouts",
+        ),
+        "draw_rate": Reducer(
+            kind="count_true",
+            source="result",
+            transform=lambda v: v == "draw",
+            normalize_by="rollouts",
+        ),
+        "illegal_rate": Reducer(
+            kind="count_true",
+            source="illegal_move",
+            normalize_by="rollouts",
+        ),
+        "total_completion_tokens": Reducer(
+            kind="sum",
+            source="completion_length",
+        ),
+    }
+
+    train_logger = RichLiveLogger(
+        keys=[
+            "loss",
+            "avg_total_reward",
+            "win_rate",
+            "loss_rate",
+            "draw_rate",
+            "illegal_rate",
+            "avg_completion_length",
+            "total_completion_tokens",
+            "num_rollouts",
+            "num_samples",
+        ],
+        spark_key="avg_total_reward",
+        history=100,
+        precision=4,
+    )
+
+    trainer = Trainer(
+        model=model,
+        algo=algo,
+        batch_source=batch_source,
+        publisher=publisher,
+        cfg=cfg,
+        checkpoint_config=checkpoint_cfg,
+        train_logger=train_logger,
+        reducers=reducers,
+    )
+
+    async def train_loop():
+        train_step = 0
+        eval_seeds = list(range(args.eval_episodes))
+        if args.eval_before_start and eval_seeds:
+            acc = await run_eval(
+                seeds=eval_seeds,
+                client=client,
+                model=args.model,
+                concurrency=args.eval_concurrency,
+                max_tokens=250,
+                temperature=args.eval_temperature,
+                max_steps=args.max_steps_per_episode,
+            )
+            print(f"[eval @ step 0] win_rate={acc:.2f}% on {len(eval_seeds)} episodes")
+
+        for _ in range(args.train_steps):
+            if seeds_q.empty():
+                print("No more episodes; stopping training loop.")
+                break
+            stats = await trainer.train_step()
+            train_step = int(stats["train_step"])
+            if args.eval_every > 0 and train_step % args.eval_every == 0 and eval_seeds:
+                acc = await run_eval(
+                    seeds=eval_seeds,
+                    client=client,
+                    model=args.model,
+                    concurrency=args.eval_concurrency,
+                    max_tokens=250,
+                    temperature=args.eval_temperature,
+                    max_steps=args.max_steps_per_episode,
+                )
+                print(f"[eval @ step {train_step}] win_rate={acc:.2f}% on {len(eval_seeds)} episodes")
+
+    asyncio.run(train_loop())
+
+
+if __name__ == "__main__":
+    main()
+
