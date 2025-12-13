@@ -245,7 +245,8 @@ class Trainer:
                 # Fallback for generic torch modules if needed, though usually HF specific
                 pass
         # --------------------------------------------------------------
-
+        self.model.config.use_cache = False
+        
         # Initialize optimizer
         self.optimizer = self.initialize_optimizer()
 
