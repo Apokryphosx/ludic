@@ -50,7 +50,7 @@ log_memory_every = 1
 log_memory_per_micro_step = false
 
 # Weight syncing defaults
-sync_every_steps = 5
+sync_every_steps = 1
 
 # -------------------------
 # Eval defaults
