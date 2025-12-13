@@ -26,8 +26,8 @@ port = 8000
 
 train_episodes = 256
 concurrency = 8
-batch_size = 4
-train_steps = 100
+batch_size = 8
+train_steps = 200
 max_steps_per_episode = 5
 
 lora_rank = 16
