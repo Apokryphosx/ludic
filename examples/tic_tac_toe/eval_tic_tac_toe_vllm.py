@@ -17,6 +17,8 @@ from typing import List, Dict
 
 import requests
 
+from config_utils import apply_config_to_args, load_toml, select_section
+
 from ludic.agents.base_agent import Agent
 from ludic.context.full_dialog import FullDialog
 from ludic.inference.vllm_client import VLLMChatClient
@@ -109,8 +111,8 @@ async def eval_episodes(
         "win_rate": Reducer(kind="count_true", source="result", transform=lambda v: v == "win", normalize_by="rollouts"),
         "loss_rate": Reducer(kind="count_true", source="result", transform=lambda v: v == "loss", normalize_by="rollouts"),
         "draw_rate": Reducer(kind="count_true", source="result", transform=lambda v: v == "draw", normalize_by="rollouts"),
-        "illegal_rate": Reducer(kind="count_true", source="illegal_move", normalize_by="samples"),
-        "parse_err_rate": Reducer(kind="count_true", source="parse_error", normalize_by="samples"),
+        "illegal_rate": Reducer(kind="count_true", source="illegal_move", normalize_by="rollouts"),
+        "parse_err_rate": Reducer(kind="count_true", source="parse_error", normalize_by="rollouts"),
         "avg_completion_length": Reducer(kind="mean", source="completion_length"),
         "total_completion_tokens": Reducer(kind="sum", source="completion_length"),
     }
@@ -221,6 +223,7 @@ async def eval_episodes(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Start a vLLM server (optional) and evaluate a model on Tic-Tac-Toe.")
+    parser.add_argument("--config", type=str, default=None, help="Optional TOML config path (top-level + [eval] section). CLI flags override config.")
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -248,6 +251,26 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=5, help="Max steps per episode.")
 
     args = parser.parse_args()
+
+    if args.config:
+        cfg = select_section(load_toml(args.config), "eval")
+        args = apply_config_to_args(
+            args,
+            config=cfg,
+            option_strings_by_dest={
+                "model": ["--model"],
+                "host": ["--host"],
+                "port": ["--port"],
+                "start_server": ["--start-server"],
+                "episodes": ["--episodes"],
+                "temperature": ["--temperature"],
+                "max_tokens": ["--max-tokens"],
+                "timeout_s": ["--timeout-s"],
+                "out": ["--out"],
+                "concurrency": ["--concurrency"],
+                "max_steps": ["--max-steps"],
+            },
+        )
 
     seeds = list(range(args.episodes))
     print(f"Prepared {len(seeds)} Tic-Tac-Toe episodes (seeded).")

@@ -1,0 +1,71 @@
+# Defaults copied from:
+# - `examples/tic_tac_toe/train_tic_tac_toe.py`
+# - `examples/tic_tac_toe/eval_tic_tac_toe_vllm.py`
+#
+# Config is read from top-level keys + section keys:
+# - training reads: top-level + [train]
+# - eval reads:     top-level + [eval]
+#
+# Any CLI flags you pass override values here.
+
+# -------------------------
+# Shared (train + eval)
+# -------------------------
+model = "Qwen/Qwen2.5-7B-Instruct"
+host = "127.0.0.1"
+port = 8000
+
+# -------------------------
+# Train defaults
+# -------------------------
+[train]
+# (Repeated here for full overview; top-level also works.)
+model = "Qwen/Qwen2.5-7B-Instruct"
+host = "127.0.0.1"
+port = 8000
+
+train_episodes = 256
+concurrency = 8
+batch_size = 4
+train_steps = 100
+max_steps_per_episode = 5
+
+lora_rank = 16
+lora_alpha_mult = 2.0
+lora_dropout = 0.0
+
+train_temperature = 1.0
+eval_every = 10
+eval_before_start = true
+eval_episodes = 200
+eval_concurrency = 32
+eval_temperature = 0.6
+
+rollout_log = "tictactoe_train_rollouts.jsonl"
+
+# Debug / memory logging defaults
+max_seq_len = 0                 # 0 = no truncation
+log_memory = false
+log_memory_every = 1
+log_memory_per_micro_step = false
+
+# -------------------------
+# Eval defaults
+# -------------------------
+[eval]
+# (Repeated here for full overview; top-level also works.)
+model = "Qwen/Qwen2.5-7B-Instruct"
+host = "127.0.0.1"
+port = 8000
+
+start_server = false
+episodes = 200
+temperature = 0.6
+max_tokens = 250
+
+# TOML has no null; omit this key to keep the script default of None:
+# timeout_s = <unset>           # default is None
+
+out = "tictactoe_eval.jsonl"
+concurrency = 32
+max_steps = 5

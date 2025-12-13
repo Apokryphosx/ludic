@@ -15,11 +15,14 @@ import argparse
 import asyncio
 import os
 import queue
+import logging
 from typing import List, Dict, Any
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import get_peft_model, LoraConfig, TaskType
+
+from config_utils import load_toml, select_section, apply_config_to_args
 
 from environments.tic_tac_toe import TicTacToeEnv
 from ludic.agents.base_agent import Agent
@@ -120,6 +123,7 @@ def build_requests_fn(
 
 def main():
     parser = argparse.ArgumentParser(description="Train a model on Tic-Tac-Toe using Ludic + vLLM.")
+    parser.add_argument("--config", type=str, default=None, help="Optional TOML config path (top-level + [train] section). CLI flags override config.")
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -138,12 +142,55 @@ def main():
     parser.add_argument("--lora-dropout", type=float, default=0.0, help="LoRA dropout probability.")
     parser.add_argument("--train-temperature", type=float, default=1.0, help="Sampling temperature for training rollouts.")
     parser.add_argument("--eval-every", type=int, default=10, help="Eval every N train steps.")
-    parser.add_argument("--eval-before-start", action="store_true", default=True, help="Run eval once before training begins.")
+    parser.add_argument(
+        "--eval-before-start",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run eval once before training begins.",
+    )
     parser.add_argument("--eval-episodes", type=int, default=200, help="Number of episodes for eval.")
     parser.add_argument("--eval-concurrency", type=int, default=32)
     parser.add_argument("--eval-temperature", type=float, default=0.6, help="Sampling temperature for eval passes.")
     parser.add_argument("--rollout-log", type=str, default="tictactoe_train_rollouts.jsonl")
+    parser.add_argument("--max-seq-len", type=int, default=0, help="Optional truncation length for training sequences (0 = no truncation).")
+    parser.add_argument("--log-memory", action="store_true", help="Log CPU/CUDA memory stats during training.")
+    parser.add_argument("--log-memory-every", type=int, default=1, help="Log memory every N train steps (when --log-memory).")
+    parser.add_argument("--log-memory-per-micro-step", action="store_true", help="Also log memory per micro-step (very verbose).")
     args = parser.parse_args()
+
+    if args.config:
+        cfg = select_section(load_toml(args.config), "train")
+        args = apply_config_to_args(
+            args,
+            config=cfg,
+            option_strings_by_dest={
+                "model": ["--model"],
+                "host": ["--host"],
+                "port": ["--port"],
+                "train_episodes": ["--train-episodes"],
+                "concurrency": ["--concurrency"],
+                "batch_size": ["--batch-size"],
+                "train_steps": ["--train-steps"],
+                "max_steps_per_episode": ["--max-steps-per-episode"],
+                "lora_rank": ["--lora-rank"],
+                "lora_alpha_mult": ["--lora-alpha-mult"],
+                "lora_dropout": ["--lora-dropout"],
+                "train_temperature": ["--train-temperature"],
+                "eval_every": ["--eval-every"],
+                "eval_before_start": ["--eval-before-start", "--no-eval-before-start"],
+                "eval_episodes": ["--eval-episodes"],
+                "eval_concurrency": ["--eval-concurrency"],
+                "eval_temperature": ["--eval-temperature"],
+                "rollout_log": ["--rollout-log"],
+                "max_seq_len": ["--max-seq-len"],
+                "log_memory": ["--log-memory"],
+                "log_memory_every": ["--log-memory-every"],
+                "log_memory_per_micro_step": ["--log-memory-per-micro-step"],
+            },
+        )
+
+    if args.log_memory:
+        logging.basicConfig(level=logging.INFO)
 
     rollout_log_path = os.path.abspath(args.rollout_log)
     os.makedirs(os.path.dirname(rollout_log_path) or ".", exist_ok=True)
@@ -239,6 +286,10 @@ def main():
         max_grad_norm=0.5,
         pad_token_id=tokenizer.pad_token_id,
         lr=5e-5,
+        max_seq_len=(args.max_seq_len if args.max_seq_len and args.max_seq_len > 0 else None),
+        log_memory=bool(args.log_memory),
+        log_memory_every_steps=max(1, int(args.log_memory_every)),
+        log_memory_per_micro_step=bool(args.log_memory_per_micro_step),
     )
     checkpoint_cfg = CheckpointConfig(
         output_dir="checkpoints_tictactoe",
@@ -268,7 +319,7 @@ def main():
         "illegal_rate": Reducer(
             kind="count_true",
             source="illegal_move",
-            normalize_by="samples",
+            normalize_by="rollouts",
         ),
         "total_completion_tokens": Reducer(
             kind="sum",

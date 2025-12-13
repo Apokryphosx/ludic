@@ -34,6 +34,7 @@ def _collate_saw_items(
     *,
     pad_token_id: int,
     device: torch.device,
+    max_seq_len: Optional[int] = None,
 ) -> Dict[str, Tensor]:
     """
     Collate a list of SAWItem into a simple dense batch of tensors.
@@ -53,7 +54,10 @@ def _collate_saw_items(
     if not items:
         raise ValueError("Cannot collate empty list of SAWItems")
 
-    lengths = [len(it.input_ids) for it in items]
+    if max_seq_len is not None and max_seq_len > 0:
+        lengths = [min(len(it.input_ids), max_seq_len) for it in items]
+    else:
+        lengths = [len(it.input_ids) for it in items]
     max_len = max(lengths)
 
     input_ids_list: List[Tensor] = []
@@ -62,15 +66,26 @@ def _collate_saw_items(
     weights_list: List[Tensor] = []
 
     for it in items:
-        L = len(it.input_ids)
+        # Optional truncation: keep the most recent tokens (right side).
+        # This preserves the action tail in [state || action].
+        if max_seq_len is not None and max_seq_len > 0 and len(it.input_ids) > max_seq_len:
+            input_ids = it.input_ids[-max_seq_len:]
+            attention_mask = it.attention_mask[-max_seq_len:]
+            action_mask = it.action_mask[-max_seq_len:]
+        else:
+            input_ids = it.input_ids
+            attention_mask = it.attention_mask
+            action_mask = it.action_mask
+
+        L = len(input_ids)
 
         ids = torch.full((max_len,), pad_token_id, dtype=torch.long)
         am = torch.zeros((max_len,), dtype=torch.long)
         actm = torch.zeros((max_len,), dtype=torch.float32)
 
-        ids[:L] = torch.tensor(it.input_ids, dtype=torch.long)
-        am[:L] = torch.tensor(it.attention_mask, dtype=torch.long)
-        actm[:L] = torch.tensor(it.action_mask, dtype=torch.float32)
+        ids[:L] = torch.tensor(input_ids, dtype=torch.long)
+        am[:L] = torch.tensor(attention_mask, dtype=torch.long)
+        actm[:L] = torch.tensor(action_mask, dtype=torch.float32)
 
         input_ids_list.append(ids)
         attn_mask_list.append(am)
@@ -314,6 +329,14 @@ class Trainer:
         # from the previous state (which should be zero).
         self.model.train()
 
+        log_memory = bool(getattr(self.cfg, "log_memory", False))
+        log_memory_every_steps = int(getattr(self.cfg, "log_memory_every_steps", 1) or 1)
+        log_memory_per_micro_step = bool(getattr(self.cfg, "log_memory_per_micro_step", False))
+        should_log_step = log_memory and (self._train_step_idx % log_memory_every_steps == 0)
+
+        if should_log_step:
+            self._log_memory("train_step/start")
+
         for micro_step_idx in range(grad_accum_steps):
             
             # ---- 1a) Sample Valid Micro-batch (with Rejection Loop) ----
@@ -354,10 +377,15 @@ class Trainer:
             )
 
             # ---- 1b) Collate into tensors ------------------------------
+            max_seq_len = getattr(self.cfg, "max_seq_len", None)
+            if isinstance(max_seq_len, int) and max_seq_len <= 0:
+                max_seq_len = None
+
             batch_tensors = _collate_saw_items(
                 saw_batch.items,
                 pad_token_id=self.cfg.pad_token_id,
                 device=device,
+                max_seq_len=max_seq_len,
             )
 
             # Debug: Check tensor shape [Batch, Time]
@@ -377,12 +405,31 @@ class Trainer:
             )
 
             # ---- 1d) Loss + backward (scaled) --------------------------
-            with no_sync_context:
-                loss, stats = self.algo.compute_loss(self.model, batch_tensors)
+            if should_log_step and log_memory_per_micro_step:
+                self._log_memory(f"train_step/micro{micro_step_idx+1}/pre_fwd")
 
-                # Scale loss for accumulation
-                scaled_loss = loss / grad_accum_steps
-                scaled_loss.backward()
+            try:
+                if should_log_step and log_memory_per_micro_step and torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()
+
+                with no_sync_context:
+                    loss, stats = self.algo.compute_loss(self.model, batch_tensors)
+
+                    if should_log_step and log_memory_per_micro_step:
+                        self._log_memory(f"train_step/micro{micro_step_idx+1}/post_fwd")
+
+                    # Scale loss for accumulation
+                    scaled_loss = loss / grad_accum_steps
+                    scaled_loss.backward()
+
+                if should_log_step and log_memory_per_micro_step:
+                    self._log_memory(f"train_step/micro{micro_step_idx+1}/post_bwd")
+
+            except torch.cuda.OutOfMemoryError:
+                if bool(getattr(self.cfg, "log_memory_summary_on_oom", True)) and torch.cuda.is_available():
+                    logger.error("CUDA OOM in train_step at step=%s micro=%s", self._train_step_idx, micro_step_idx)
+                    logger.error(self._cuda_memory_summary())
+                raise
 
             all_micro_stats.append(stats)
 
@@ -409,7 +456,11 @@ class Trainer:
 
         # ---- 5) Push policy update into runtime ------------------------
         if self._train_step_idx % self.sync_every_steps == 0:
+            if should_log_step:
+                self._log_memory("train_step/pre_publish")
             self._push_weights_to_runtime()
+            if should_log_step:
+                self._log_memory("train_step/post_publish")
 
         # ---- 6) Enrich stats -------------------------------------------
         final_stats = aggregate_stats(all_micro_stats, all_saw_batches, reducers=self.reducers)
@@ -431,7 +482,58 @@ class Trainer:
             except Exception:
                 logger.exception("Stats logger failed at step %s", self._train_step_idx)
 
+        if should_log_step:
+            self._log_memory("train_step/end")
+
         return final_stats
+
+    # ------------------------------------------------------------------
+    # Memory logging helpers
+    # ------------------------------------------------------------------
+
+    def _log_memory(self, tag: str) -> None:
+        parts = [f"[mem] {tag}"]
+        rss = self._process_rss_bytes()
+        if rss is not None:
+            parts.append(f"rss={rss/1024/1024:.0f}MiB")
+        if torch.cuda.is_available():
+            try:
+                parts.append(self._cuda_memory_brief())
+            except Exception:
+                logger.exception("Failed to collect CUDA memory stats")
+        logger.info(" ".join(parts))
+
+    def _process_rss_bytes(self) -> Optional[int]:
+        # Linux-only (this repo runs primarily in Linux containers).
+        status_path = "/proc/self/status"
+        try:
+            with open(status_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        # e.g. "VmRSS:\t  123456 kB"
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[1].isdigit():
+                            return int(parts[1]) * 1024
+                        return None
+        except OSError:
+            return None
+        return None
+
+    def _cuda_memory_brief(self) -> str:
+        allocated = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        max_alloc = torch.cuda.max_memory_allocated()
+        max_reserved = torch.cuda.max_memory_reserved()
+        return (
+            f"cuda_alloc={allocated/1024/1024:.0f}MiB "
+            f"cuda_reserved={reserved/1024/1024:.0f}MiB "
+            f"cuda_peak_alloc={max_alloc/1024/1024:.0f}MiB "
+            f"cuda_peak_reserved={max_reserved/1024/1024:.0f}MiB"
+        )
+
+    def _cuda_memory_summary(self) -> str:
+        # Use abbreviated=True to keep logs readable.
+        return torch.cuda.memory_summary(abbreviated=True)
 
     # ------------------------------------------------------------------
     # Sync wrappers for non-async callers

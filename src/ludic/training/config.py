@@ -47,6 +47,27 @@ class TrainerConfig:
 
     - pad_token_id:
           Used when padding sequences during SAW collation.
+
+    - max_seq_len:
+          Optional hard cap on sequence length after collation. If set, each
+          SAWItem is truncated from the left (keeps the most recent tokens),
+          which preserves the action region at the end of the sequence.
+
+    ==========================
+    Debugging
+    ==========================
+
+    - log_memory:
+          If True, logs process RSS and CUDA memory stats periodically.
+
+    - log_memory_every_steps:
+          How often (macro-steps) to log memory when log_memory=True.
+
+    - log_memory_per_micro_step:
+          If True, also logs memory at micro-step granularity.
+
+    - log_memory_summary_on_oom:
+          If True, prints torch CUDA memory summary on OOM exceptions.
     """
 
     # ----- model / optimization -------------------
@@ -70,3 +91,10 @@ class TrainerConfig:
 
     # ----- collation ------------------------------
     pad_token_id: int = 0
+    max_seq_len: Optional[int] = None
+
+    # ----- debugging ------------------------------
+    log_memory: bool = False
+    log_memory_every_steps: int = 1
+    log_memory_per_micro_step: bool = False
+    log_memory_summary_on_oom: bool = True
