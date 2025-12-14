@@ -53,7 +53,7 @@ every_n_steps = 10
 episodes = 200
 concurrency = 32
 temperature = 0.6
-timeout_s = null
+timeout_s = ""                 # float seconds (e.g. "30"), or "" to disable
 
 [logging]
 level = "INFO"

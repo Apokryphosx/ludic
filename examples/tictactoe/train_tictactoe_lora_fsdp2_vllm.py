@@ -96,6 +96,19 @@ def _normalize_resume_from(v: Any) -> int | str | None:
     raise TypeError(f"checkpoint.resume_from must be int, str, or empty; got {type(v)}")
 
 
+def _normalize_optional_float(v: Any) -> float | None:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "" or s.lower() == "null":
+            return None
+        return float(s)
+    raise TypeError(f"Expected float/int/str/empty, got {type(v)}")
+
+
 def _configure_logging(*, rank: int, level: str) -> None:
     numeric = getattr(logging, level.upper(), logging.INFO)
     logging.basicConfig(
@@ -497,8 +510,7 @@ def main() -> None:
     eval_episodes = int(_get(cfg, "eval.episodes", 200))
     eval_concurrency = int(_get(cfg, "eval.concurrency", 32))
     eval_temperature = float(_get(cfg, "eval.temperature", 0.6))
-    eval_timeout_s = _get(cfg, "eval.timeout_s", None)
-    eval_timeout_s = float(eval_timeout_s) if eval_timeout_s is not None else None
+    eval_timeout_s = _normalize_optional_float(_get(cfg, "eval.timeout_s", None))
 
     train_steps = int(_get(cfg, "trainer.train_steps", 100))
 
