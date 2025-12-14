@@ -23,7 +23,7 @@ seed = 0
 temperature = 1.0
 max_tokens = 250
 max_steps_per_episode = 5
-batch_size = 1                 # requests per batch-source call (per rank)
+batch_size = 2                 # requests per batch-source call (per rank)
 concurrency = 8                # concurrent rollouts (per rank)
 jsonl_path = "tictactoe_train_rollouts.jsonl"
 
@@ -38,7 +38,7 @@ weight_decay = 0.01
 grad_accum_steps = 8
 max_grad_norm = 0.5
 sync_every_steps = 1          # how often to push updated weights to vLLM
-gradient_checkpointing = false
+gradient_checkpointing = true
 
 [checkpoint]
 output_dir = "checkpoints_tictactoe_lora"
