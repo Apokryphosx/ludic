@@ -286,7 +286,7 @@ def main():
     # Trainer
     cfg = TrainerConfig(
         model_device="cuda" if torch.cuda.is_available() else "cpu",
-        grad_accum_steps=4,
+        grad_accum_steps=8,
         max_grad_norm=0.5,
         pad_token_id=tokenizer.pad_token_id,
         lr=5e-5,
