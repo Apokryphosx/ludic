@@ -50,7 +50,7 @@ from ludic.training.checkpoint import CheckpointConfig
 from ludic.training.config import TrainerConfig
 from ludic.training.credit_assignment import MonteCarloReturn
 from ludic.training.loss import ReinforceBaselineLoss
-from ludic.training.loggers import RichLiveLogger
+from ludic.training.loggers import PrintLogger, RichLiveLogger
 from ludic.training.stats import Reducer
 from ludic.training.trainer import Trainer
 from ludic.training.types import EnvSpec, ProtocolSpec, RolloutRequest
@@ -471,7 +471,8 @@ def main() -> None:
     }
 
     train_logger = None
-    if rank == 0 and bool(_get(cfg, "logging.rich", True)):
+    if rank == 0:
+        logger_kind = str(_get(cfg, "logging.logger", "print")).lower()
         include_gpu_memory = bool(_get(cfg, "logging.gpu_memory", True))
         keys = [
             "loss",
@@ -499,12 +500,22 @@ def main() -> None:
                     "gpu_backward_activation_peak_mb",
                 ]
             )
-        train_logger = RichLiveLogger(
-            keys=keys,
-            spark_key="avg_total_reward",
-            history=int(_get(cfg, "logging.history", 100)),
-            precision=int(_get(cfg, "logging.precision", 4)),
-        )
+
+        if logger_kind == "none":
+            train_logger = None
+        elif logger_kind == "rich" and sys.stdout.isatty():
+            train_logger = RichLiveLogger(
+                keys=keys,
+                spark_key="avg_total_reward",
+                history=int(_get(cfg, "logging.history", 100)),
+                precision=int(_get(cfg, "logging.precision", 4)),
+            )
+        else:
+            train_logger = PrintLogger(
+                prefix="[trainer]",
+                keys=keys,
+                precision=int(_get(cfg, "logging.precision", 4)),
+            )
 
     trainer = Trainer(
         model=model,

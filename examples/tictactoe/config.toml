@@ -58,7 +58,7 @@ timeout_s = ""                 # float seconds (e.g. "30"), or "" to disable
 [logging]
 level = "INFO"
 rank0_only_output = true
-rich = true
+logger = "print"               # "print", "rich", or "none"
 gpu_memory = true
 history = 100
 precision = 4
