@@ -55,10 +55,14 @@ concurrency = 32
 temperature = 0.6
 timeout_s = ""                 # float seconds (e.g. "30"), or "" to disable
 
+[preflight]
+max_model_param_gb = 20        # abort if model params (on CUDA) exceed this
+
 [logging]
 level = "DEBUG"
 rank0_only_output = true
 logger = "print"               # "print", "rich", or "none"
 gpu_memory = true
+vram_breakdown = true
 history = 100
 precision = 4

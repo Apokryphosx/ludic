@@ -33,6 +33,8 @@ if str(REPO_ROOT / "src") not in sys.path:
 import torch
 import torch.distributed as dist
 from torch.distributed import fsdp
+from torch import nn
+from torch.optim import Optimizer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, TaskType, get_peft_model
 
@@ -107,6 +109,198 @@ def _normalize_optional_float(v: Any) -> float | None:
             return None
         return float(s)
     raise TypeError(f"Expected float/int/str/empty, got {type(v)}")
+
+
+def _is_lora_param_name(name: str) -> bool:
+    # PEFT LoRA params typically include "lora_A"/"lora_B"/"lora_" in the name.
+    return "lora_" in name or "lora_A" in name or "lora_B" in name
+
+
+def _tensor_nbytes(t: torch.Tensor) -> int:
+    return int(t.numel()) * int(t.element_size())
+
+
+def _model_param_bytes(model: nn.Module) -> Dict[str, int]:
+    total = 0
+    base = 0
+    lora = 0
+    trainable = 0
+    trainable_lora = 0
+    trainable_base = 0
+
+    for name, p in model.named_parameters():
+        if not isinstance(p, torch.Tensor) or p.device.type != "cuda":
+            continue
+        b = _tensor_nbytes(p)
+        total += b
+        if _is_lora_param_name(name):
+            lora += b
+            if p.requires_grad:
+                trainable_lora += b
+        else:
+            base += b
+            if p.requires_grad:
+                trainable_base += b
+        if p.requires_grad:
+            trainable += b
+
+    return {
+        "total": total,
+        "base": base,
+        "lora": lora,
+        "trainable": trainable,
+        "trainable_base": trainable_base,
+        "trainable_lora": trainable_lora,
+    }
+
+
+def _model_buffer_bytes(model: nn.Module) -> int:
+    total = 0
+    for b in model.buffers():
+        if isinstance(b, torch.Tensor) and b.device.type == "cuda":
+            total += _tensor_nbytes(b)
+    return total
+
+
+def _model_grad_bytes(model: nn.Module) -> int:
+    total = 0
+    for p in model.parameters():
+        g = getattr(p, "grad", None)
+        if isinstance(g, torch.Tensor) and g.device.type == "cuda":
+            total += _tensor_nbytes(g)
+    return total
+
+
+def _optimizer_state_bytes(optim: Optimizer) -> Dict[str, int]:
+    total = 0
+    exp_avg = 0
+    exp_avg_sq = 0
+    tensors = 0
+
+    for state in optim.state.values():
+        if not isinstance(state, dict):
+            continue
+        for k, v in state.items():
+            if not isinstance(v, torch.Tensor) or v.device.type != "cuda":
+                continue
+            b = _tensor_nbytes(v)
+            total += b
+            tensors += 1
+            if k == "exp_avg":
+                exp_avg += b
+            elif k == "exp_avg_sq":
+                exp_avg_sq += b
+
+    return {
+        "total": total,
+        "exp_avg": exp_avg,
+        "exp_avg_sq": exp_avg_sq,
+        "tensors": tensors,
+    }
+
+
+def _vram_breakdown_stats_mb(*, model: nn.Module, optimizer: Optimizer, device: torch.device) -> Dict[str, float]:
+    mb = 1024**2
+    out: Dict[str, float] = {}
+
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return out
+
+    pbytes = _model_param_bytes(model)
+    bbytes = _model_buffer_bytes(model)
+    gbytes = _model_grad_bytes(model)
+    obytes = _optimizer_state_bytes(optimizer)
+
+    alloc = int(torch.cuda.memory_allocated(device))
+    reserved = int(torch.cuda.memory_reserved(device))
+    free = None
+    total = None
+    try:
+        free, total = torch.cuda.mem_get_info(device)  # type: ignore[arg-type]
+    except Exception:
+        pass
+
+    out.update(
+        {
+            "model_param_mb_total": pbytes["total"] / mb,
+            "model_param_mb_base": pbytes["base"] / mb,
+            "model_param_mb_lora": pbytes["lora"] / mb,
+            "model_param_mb_trainable": pbytes["trainable"] / mb,
+            "model_buffer_mb_total": bbytes / mb,
+            # Grad tensors are usually freed by Trainer.zero_grad(set_to_none=True) before logging,
+            # so this is often 0; keep it for debugging.
+            "grad_mb_allocated": gbytes / mb,
+            # Expected gradient footprint if all trainable params had grads allocated.
+            "grad_mb_expected_trainable": pbytes["trainable"] / mb,
+            "optim_state_mb_total": obytes["total"] / mb,
+            "optim_state_mb_exp_avg": obytes["exp_avg"] / mb,
+            "optim_state_mb_exp_avg_sq": obytes["exp_avg_sq"] / mb,
+            "optim_state_tensors": float(obytes["tensors"]),
+            "cuda_alloc_mb": alloc / mb,
+            "cuda_reserved_mb": reserved / mb,
+        }
+    )
+
+    if free is not None and total is not None:
+        out["cuda_free_mb"] = float(free) / mb
+        out["cuda_total_mb"] = float(total) / mb
+
+    accounted = pbytes["total"] + bbytes + gbytes + obytes["total"]
+    out["cuda_other_alloc_mb"] = max(0.0, float(alloc - accounted) / mb)
+    return out
+
+
+class _VRAMBreakdownLogger:
+    def __init__(self, inner: Any, *, model: nn.Module, optimizer: Optimizer, device: torch.device) -> None:
+        self._inner = inner
+        self._model = model
+        self._optimizer = optimizer
+        self._device = device
+
+    def log(self, step: int, stats: Dict[str, float]) -> None:
+        merged = dict(stats)
+        merged.update(_vram_breakdown_stats_mb(model=self._model, optimizer=self._optimizer, device=self._device))
+        self._inner.log(step, merged)
+
+
+def _preflight_vram_check(
+    *,
+    cfg: Mapping[str, Any],
+    model: nn.Module,
+    device: torch.device,
+    rank: int,
+) -> None:
+    if rank != 0:
+        return
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+
+    mb = 1024**2
+    param_bytes = _model_param_bytes(model)
+    buffer_bytes = _model_buffer_bytes(model)
+    param_mb = param_bytes["total"] / mb
+    buffer_mb = buffer_bytes / mb
+
+    cuda_alloc_mb = float(torch.cuda.memory_allocated(device)) / mb
+    cuda_reserved_mb = float(torch.cuda.memory_reserved(device)) / mb
+
+    max_model_param_gb = _get(cfg, "preflight.max_model_param_gb", 20)
+    max_model_param_mb = float(max_model_param_gb) * 1024.0
+
+    print(
+        "[preflight] "
+        f"model_param_mb_total={param_mb:.1f} "
+        f"(base={param_bytes['base']/mb:.1f}, lora={param_bytes['lora']/mb:.1f}) "
+        f"model_buffer_mb_total={buffer_mb:.1f} "
+        f"cuda_alloc_mb={cuda_alloc_mb:.1f} cuda_reserved_mb={cuda_reserved_mb:.1f}"
+    )
+
+    if param_mb > max_model_param_mb:
+        raise SystemExit(
+            f"Preflight failed: model parameters use {param_mb/1024.0:.2f} GiB on CUDA, "
+            f"exceeds limit {float(max_model_param_gb):.2f} GiB. "
+            "Choose a smaller model / lower precision / different placement."
+        )
 
 
 def _configure_logging(*, rank: int, level: str) -> None:
@@ -370,6 +564,8 @@ def main() -> None:
     else:
         model.to(device)
 
+    _preflight_vram_check(cfg=cfg, model=model, device=device, rank=rank)
+
     # ---- vLLM client + publisher ----
     vllm_group_port = int(_get(cfg, "vllm.group_port", 51216))
     client = VLLMChatClient(
@@ -474,6 +670,7 @@ def main() -> None:
     if rank == 0:
         logger_kind = str(_get(cfg, "logging.logger", "print")).lower()
         include_gpu_memory = bool(_get(cfg, "logging.gpu_memory", True))
+        include_vram_breakdown = bool(_get(cfg, "logging.vram_breakdown", True))
         keys = [
             "loss",
             "avg_total_reward",
@@ -498,6 +695,27 @@ def main() -> None:
                     "gpu_forward_activation_peak_mb",
                     "gpu_backward_peak_mb",
                     "gpu_backward_activation_peak_mb",
+                ]
+            )
+        if include_vram_breakdown:
+            keys.extend(
+                [
+                    "model_param_mb_total",
+                    "model_param_mb_base",
+                    "model_param_mb_lora",
+                    "model_param_mb_trainable",
+                    "model_buffer_mb_total",
+                    "grad_mb_allocated",
+                    "grad_mb_expected_trainable",
+                    "optim_state_mb_total",
+                    "optim_state_mb_exp_avg",
+                    "optim_state_mb_exp_avg_sq",
+                    "optim_state_tensors",
+                    "cuda_alloc_mb",
+                    "cuda_reserved_mb",
+                    "cuda_free_mb",
+                    "cuda_total_mb",
+                    "cuda_other_alloc_mb",
                 ]
             )
 
@@ -528,6 +746,13 @@ def main() -> None:
         reducers=reducers,
         resume_from=_normalize_resume_from(_get(cfg, "checkpoint.resume_from", None)),
     )
+    if rank == 0 and trainer.train_logger is not None and bool(_get(cfg, "logging.vram_breakdown", True)):
+        trainer.train_logger = _VRAMBreakdownLogger(
+            trainer.train_logger,
+            model=model,
+            optimizer=trainer.optimizer,
+            device=device,
+        )
 
     # ---- eval config ----
     do_eval = bool(_get(cfg, "eval.enabled", True))
