@@ -1,0 +1,64 @@
+# Tic-Tac-Toe LoRA RL training config (vLLM must already be running).
+
+[model]
+name = "Qwen/Qwen2.5-7B-Instruct"
+dtype = "bf16"                 # "bf16" or "fp16"
+trust_remote_code = true
+
+[lora]
+rank = 16
+alpha_mult = 2.0               # lora_alpha = rank * alpha_mult
+dropout = 0.0
+target_modules = "all-linear"  # PEFT shortcut; or list of module names
+
+[vllm]
+host = "127.0.0.1"
+port = 8000
+group_port = 51216             # must match the vLLM weight-update group port
+enable_weight_updates = true   # only rank0 performs weight updates
+health_timeout_s = 30.0
+
+[rollouts]
+seed = 0
+temperature = 1.0
+max_tokens = 250
+max_steps_per_episode = 5
+batch_size = 4                 # requests per batch-source call (per rank)
+concurrency = 8                # concurrent rollouts (per rank)
+jsonl_path = "tictactoe_train_rollouts.jsonl"
+
+[algo]
+gamma = 1.0
+normalize_advantages = true
+
+[trainer]
+train_steps = 100
+lr = 5e-5
+weight_decay = 0.01
+grad_accum_steps = 8
+max_grad_norm = 0.5
+sync_every_steps = 5           # how often to push updated weights to vLLM
+
+[checkpoint]
+output_dir = "checkpoints_tictactoe_lora"
+every_n_steps = 25
+max_to_keep = 2
+save_optimizer = true
+resume_from = null             # step number (e.g. 100) or path, or null
+
+[eval]
+enabled = true
+before_start = true
+every_n_steps = 10
+episodes = 200
+concurrency = 32
+temperature = 0.6
+timeout_s = null
+
+[logging]
+level = "INFO"
+rank0_only_output = true
+rich = true
+history = 100
+precision = 4
+
