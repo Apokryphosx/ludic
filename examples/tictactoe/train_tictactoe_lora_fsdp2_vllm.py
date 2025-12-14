@@ -42,7 +42,7 @@ from ludic.context.full_dialog import FullDialog
 from ludic.distributed.adapters import create_vllm_publisher
 from ludic.inference.vllm_client import VLLMChatClient
 from ludic.interaction.single_agent import SingleAgentSyncProtocol
-from ludic.parsers import Parser, compose_parsers, cot_prefix_parser, token_guard_parser, xml_move_parser
+from ludic.parsers import Parser, compose_parsers, cot_prefix_parser, xml_move_parser
 from ludic.training.algorithm import RLAlgorithm
 from ludic.training.batching.rollout_engine import RolloutEngine
 from ludic.training.batching.synced_batching import RolloutBatchSource
@@ -144,11 +144,9 @@ def _wait_for_vllm_health(*, host: str, port: int, timeout_s: float) -> None:
 
 
 def _build_tictactoe_parser(max_tokens: int) -> Parser:
-    return compose_parsers(
-        token_guard_parser(max_tokens),
-        cot_prefix_parser,
-        xml_move_parser,
-    )
+    # Repo no longer ships token_guard_parser; vLLM-side `max_tokens` already bounds length.
+    # Keep parsing strict on format (<think>...</think> + <move>...</move>).
+    return compose_parsers(cot_prefix_parser, xml_move_parser)
 
 
 async def _run_eval(
