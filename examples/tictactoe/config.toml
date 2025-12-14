@@ -37,7 +37,7 @@ lr = 5e-5
 weight_decay = 0.01
 grad_accum_steps = 8
 max_grad_norm = 0.5
-sync_every_steps = 5           # how often to push updated weights to vLLM
+sync_every_steps = 1          # how often to push updated weights to vLLM
 
 [checkpoint]
 output_dir = "checkpoints_tictactoe_lora"
