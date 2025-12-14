@@ -120,37 +120,61 @@ def _tensor_nbytes(t: torch.Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
 
-def _model_param_bytes(model: nn.Module) -> Dict[str, int]:
-    total = 0
-    base = 0
-    lora = 0
-    trainable = 0
-    trainable_lora = 0
-    trainable_base = 0
+def _model_param_stats(model: nn.Module) -> Dict[str, int]:
+    bytes_total = 0
+    bytes_base = 0
+    bytes_lora = 0
+    bytes_trainable = 0
+    bytes_trainable_lora = 0
+    bytes_trainable_base = 0
+
+    count_total = 0
+    count_base = 0
+    count_lora = 0
+    count_trainable = 0
+    count_trainable_lora = 0
+    count_trainable_base = 0
 
     for name, p in model.named_parameters():
         if not isinstance(p, torch.Tensor) or p.device.type != "cuda":
             continue
+        n = int(p.numel())
         b = _tensor_nbytes(p)
-        total += b
-        if _is_lora_param_name(name):
-            lora += b
+
+        bytes_total += b
+        count_total += n
+
+        is_lora = _is_lora_param_name(name)
+        if is_lora:
+            bytes_lora += b
+            count_lora += n
             if p.requires_grad:
-                trainable_lora += b
+                bytes_trainable_lora += b
+                count_trainable_lora += n
         else:
-            base += b
+            bytes_base += b
+            count_base += n
             if p.requires_grad:
-                trainable_base += b
+                bytes_trainable_base += b
+                count_trainable_base += n
+
         if p.requires_grad:
-            trainable += b
+            bytes_trainable += b
+            count_trainable += n
 
     return {
-        "total": total,
-        "base": base,
-        "lora": lora,
-        "trainable": trainable,
-        "trainable_base": trainable_base,
-        "trainable_lora": trainable_lora,
+        "bytes_total": bytes_total,
+        "bytes_base": bytes_base,
+        "bytes_lora": bytes_lora,
+        "bytes_trainable": bytes_trainable,
+        "bytes_trainable_base": bytes_trainable_base,
+        "bytes_trainable_lora": bytes_trainable_lora,
+        "count_total": count_total,
+        "count_base": count_base,
+        "count_lora": count_lora,
+        "count_trainable": count_trainable,
+        "count_trainable_base": count_trainable_base,
+        "count_trainable_lora": count_trainable_lora,
     }
 
 
@@ -206,7 +230,7 @@ def _vram_breakdown_stats_mb(*, model: nn.Module, optimizer: Optimizer, device: 
     if device.type != "cuda" or not torch.cuda.is_available():
         return out
 
-    pbytes = _model_param_bytes(model)
+    p = _model_param_stats(model)
     bbytes = _model_buffer_bytes(model)
     gbytes = _model_grad_bytes(model)
     obytes = _optimizer_state_bytes(optimizer)
@@ -222,16 +246,20 @@ def _vram_breakdown_stats_mb(*, model: nn.Module, optimizer: Optimizer, device: 
 
     out.update(
         {
-            "model_param_mb_total": pbytes["total"] / mb,
-            "model_param_mb_base": pbytes["base"] / mb,
-            "model_param_mb_lora": pbytes["lora"] / mb,
-            "model_param_mb_trainable": pbytes["trainable"] / mb,
+            "model_param_mb_total": p["bytes_total"] / mb,
+            "model_param_mb_base": p["bytes_base"] / mb,
+            "model_param_mb_lora": p["bytes_lora"] / mb,
+            "model_param_mb_trainable": p["bytes_trainable"] / mb,
+            "model_param_count_total": float(p["count_total"]),
+            "model_param_count_base": float(p["count_base"]),
+            "model_param_count_lora": float(p["count_lora"]),
+            "model_param_count_trainable": float(p["count_trainable"]),
             "model_buffer_mb_total": bbytes / mb,
             # Grad tensors are usually freed by Trainer.zero_grad(set_to_none=True) before logging,
             # so this is often 0; keep it for debugging.
             "grad_mb_allocated": gbytes / mb,
             # Expected gradient footprint if all trainable params had grads allocated.
-            "grad_mb_expected_trainable": pbytes["trainable"] / mb,
+            "grad_mb_expected_trainable": p["bytes_trainable"] / mb,
             "optim_state_mb_total": obytes["total"] / mb,
             "optim_state_mb_exp_avg": obytes["exp_avg"] / mb,
             "optim_state_mb_exp_avg_sq": obytes["exp_avg_sq"] / mb,
@@ -245,7 +273,7 @@ def _vram_breakdown_stats_mb(*, model: nn.Module, optimizer: Optimizer, device: 
         out["cuda_free_mb"] = float(free) / mb
         out["cuda_total_mb"] = float(total) / mb
 
-    accounted = pbytes["total"] + bbytes + gbytes + obytes["total"]
+    accounted = p["bytes_total"] + bbytes + gbytes + obytes["total"]
     out["cuda_other_alloc_mb"] = max(0.0, float(alloc - accounted) / mb)
     return out
 
@@ -276,9 +304,9 @@ def _preflight_vram_check(
         return
 
     mb = 1024**2
-    param_bytes = _model_param_bytes(model)
+    param = _model_param_stats(model)
     buffer_bytes = _model_buffer_bytes(model)
-    param_mb = param_bytes["total"] / mb
+    param_mb = param["bytes_total"] / mb
     buffer_mb = buffer_bytes / mb
 
     cuda_alloc_mb = float(torch.cuda.memory_allocated(device)) / mb
@@ -290,7 +318,9 @@ def _preflight_vram_check(
     print(
         "[preflight] "
         f"model_param_mb_total={param_mb:.1f} "
-        f"(base={param_bytes['base']/mb:.1f}, lora={param_bytes['lora']/mb:.1f}) "
+        f"(base={param['bytes_base']/mb:.1f}, lora={param['bytes_lora']/mb:.1f}) "
+        f"model_param_count_total={param['count_total']} "
+        f"(base={param['count_base']}, lora={param['count_lora']}, trainable={param['count_trainable']}) "
         f"model_buffer_mb_total={buffer_mb:.1f} "
         f"cuda_alloc_mb={cuda_alloc_mb:.1f} cuda_reserved_mb={cuda_reserved_mb:.1f}"
     )
@@ -704,6 +734,10 @@ def main() -> None:
                     "model_param_mb_base",
                     "model_param_mb_lora",
                     "model_param_mb_trainable",
+                    "model_param_count_total",
+                    "model_param_count_base",
+                    "model_param_count_lora",
+                    "model_param_count_trainable",
                     "model_buffer_mb_total",
                     "grad_mb_allocated",
                     "grad_mb_expected_trainable",
