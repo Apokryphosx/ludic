@@ -472,20 +472,35 @@ def main() -> None:
 
     train_logger = None
     if rank == 0 and bool(_get(cfg, "logging.rich", True)):
+        include_gpu_memory = bool(_get(cfg, "logging.gpu_memory", True))
+        keys = [
+            "loss",
+            "avg_total_reward",
+            "win_rate",
+            "loss_rate",
+            "draw_rate",
+            "illegal_rate",
+            "parse_err_rate",
+            "avg_completion_length",
+            "total_completion_tokens",
+            "num_rollouts",
+            "num_samples",
+        ]
+        if include_gpu_memory:
+            keys.extend(
+                [
+                    "gpu_mem_alloc_mb",
+                    "gpu_mem_reserved_mb",
+                    "gpu_mem_peak_mb",
+                    "gpu_activation_peak_mb",
+                    "gpu_forward_peak_mb",
+                    "gpu_forward_activation_peak_mb",
+                    "gpu_backward_peak_mb",
+                    "gpu_backward_activation_peak_mb",
+                ]
+            )
         train_logger = RichLiveLogger(
-            keys=[
-                "loss",
-                "avg_total_reward",
-                "win_rate",
-                "loss_rate",
-                "draw_rate",
-                "illegal_rate",
-                "parse_err_rate",
-                "avg_completion_length",
-                "total_completion_tokens",
-                "num_rollouts",
-                "num_samples",
-            ],
+            keys=keys,
             spark_key="avg_total_reward",
             history=int(_get(cfg, "logging.history", 100)),
             precision=int(_get(cfg, "logging.precision", 4)),
