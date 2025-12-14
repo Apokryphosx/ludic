@@ -779,6 +779,7 @@ def main() -> None:
         train_logger=train_logger,
         reducers=reducers,
         resume_from=_normalize_resume_from(_get(cfg, "checkpoint.resume_from", None)),
+        enable_gradient_checkpointing=bool(_get(cfg, "trainer.gradient_checkpointing", False)),
     )
     if rank == 0 and trainer.train_logger is not None and bool(_get(cfg, "logging.vram_breakdown", True)):
         trainer.train_logger = _VRAMBreakdownLogger(
