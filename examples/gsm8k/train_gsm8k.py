@@ -24,24 +24,24 @@ from datasets import load_dataset  # type: ignore
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from environments.gsm8k import GSM8KEnv
 
-from ludic.agents.base_agent import Agent
-from ludic.context.full_dialog import FullDialog
-from ludic.distributed.adapters import create_vllm_publisher
-from ludic.inference.vllm_client import VLLMChatClient
-from ludic.interaction.single_agent import SingleAgentSyncProtocol
+from ludic.agent import Agent
+from ludic.context import FullDialog
+from ludic.inference import VLLMChatClient
+from ludic.interaction import SingleAgentSyncProtocol
 from ludic.parsers import boxed_parser
-from ludic.training.algorithm import RLAlgorithm
-from ludic.training.batching.rollout_engine import RolloutEngine
-from ludic.training.batching.synced_batching import RolloutBatchSource
-from ludic.training.batching.intra_batch_control import GRPORequestStrategy
-from ludic.training.credit_assignment import GroupNormalizedReturn
-from ludic.training.loss import ReinforceLoss
-from ludic.training.trainer import Trainer
-from ludic.training.config import TrainerConfig
-from ludic.training.checkpoint import CheckpointConfig
-from ludic.training.types import EnvSpec, ProtocolSpec, RolloutRequest
-from ludic.training.stats import Reducer
-from ludic.training.loggers import RichLiveLogger
+from ludic.distributed.adapters import create_vllm_publisher
+from ludic.training import (
+    RLAlgorithm,
+    RolloutEngine,
+    RolloutBatchSource,
+    Trainer,
+    TrainerConfig,
+    CheckpointConfig,
+    make_dataset_queue_requests_fn,
+    GroupNormalizedReturn,
+    ReinforceLoss,
+)
+from ludic.training import Reducer, RichLiveLogger
 
 
 def load_gsm8k(split: str, limit: int | None) -> List[Dict[str, Any]]:
@@ -97,36 +97,6 @@ async def run_eval(
     results = await asyncio.gather(*[_run_one(s) for s in samples])
     correct = sum(1 for r in results if r)
     return 100.0 * correct / len(samples) if samples else 0.0
-
-
-def build_requests_fn(
-    samples_q: queue.Queue,
-    batch_size: int,
-    sampling_args: Dict[str, Any],
-    *,
-    group_size: int,
-):
-    def _fn() -> List[RolloutRequest]:
-        reqs: List[RolloutRequest] = []
-        for _ in range(batch_size):
-            if samples_q.empty():
-                break
-            idx, sample = samples_q.get()
-            reqs.append(
-                RolloutRequest(
-                    env=EnvSpec(kind="gsm8k", kwargs={"sample": sample}),
-                    protocol=ProtocolSpec(kind="single_agent", kwargs={}),
-                    num_episodes=1,
-                    seed=int(idx),
-                    sampling_args=sampling_args,
-                )
-            )
-        if not reqs:
-            return []
-        strategy = GRPORequestStrategy(group_size=group_size)
-        return strategy.expand(reqs)
-
-    return _fn
 
 
 def main():
@@ -214,7 +184,20 @@ def main():
         "max_tokens": 512,
         "extras": {"extra_body": {"return_token_ids": True}},
     }
-    requests_fn = build_requests_fn(samples_q, args.batch_size, sampling_args, group_size=args.group_size)
+    requests_fn = make_dataset_queue_requests_fn(
+        samples_q,
+        batch_size=args.batch_size,
+        env_kind="gsm8k",
+        protocol_kind="single_agent",
+        sampling_args=sampling_args,
+        protocol_kwargs={},
+        request_meta_fn=lambda idx, sample: {
+            "sample_index": idx,
+            "question_id": sample.get("id", idx),
+        },
+        seed_fn=lambda idx, _sample: idx,
+        group_size=args.group_size,
+    )
     batch_source = RolloutBatchSource(
         orchestrator=engine,
         credit_assigner=algo.credit_assigner,

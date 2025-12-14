@@ -12,23 +12,14 @@ import signal
 import subprocess
 from typing import List, Dict
 
-from ludic.agents.base_agent import Agent
-from ludic.context.full_dialog import FullDialog
-from ludic.inference.vllm_client import VLLMChatClient
-from ludic.inference.vllm_utils import start_vllm_server, wait_for_vllm_health
-from ludic.interaction.single_agent import SingleAgentSyncProtocol
-from ludic.parsers import Parser, compose_parsers, cot_prefix_parser, token_guard_parser, xml_move_parser
+from ludic.agent import Agent
+from ludic.context import FullDialog
+from ludic.inference import VLLMChatClient, start_vllm_server, wait_for_vllm_health
+from ludic.interaction import SingleAgentSyncProtocol
+from ludic.parsers import compose_parsers, cot_prefix_parser, xml_move_parser
 from ludic.types import SamplingArgs
 from environments.tic_tac_toe import TicTacToeEnv
-from ludic.training.stats import Reducer, apply_reducers_to_records
-
-def build_tictactoe_parser(max_tokens: int) -> Parser:
-    return compose_parsers(
-        token_guard_parser(max_tokens),
-        cot_prefix_parser,
-        xml_move_parser,
-    )
-
+from ludic.training import Reducer, apply_reducers_to_records
 
 async def eval_episodes(
     *,
@@ -42,7 +33,7 @@ async def eval_episodes(
     max_steps: int,
     concurrency: int = 1,
 ) -> List[dict]:
-    parser = build_tictactoe_parser(max_tokens)
+    action_parser = compose_parsers(cot_prefix_parser, xml_move_parser)
     reducers: Dict[str, Reducer] = {
         "win_rate": Reducer(kind="count_true", source="result", transform=lambda v: v == "win", normalize_by="rollouts"),
         "loss_rate": Reducer(kind="count_true", source="result", transform=lambda v: v == "loss", normalize_by="rollouts"),
@@ -72,25 +63,26 @@ async def eval_episodes(
     parse_errors = 0
     records: List[dict] = []
 
+    base_env = TicTacToeEnv(agent_starts=True)
+    base_prompt = base_env.suggested_sysprompt or ""
+    sys_prompt = (
+        base_prompt
+        + "\n\nThink through the board in <think>...</think> and output your move as a single XML tag, e.g., <move>A1</move>."
+    )
+
     idx = 0
     while idx < len(seeds):
         batch_seeds = seeds[idx : idx + concurrency]
-        batch_size = len(batch_seeds)
         tasks = []
         for seed in batch_seeds:
             env = TicTacToeEnv(agent_starts=True)
-            base_prompt = env.suggested_sysprompt or ""
-            sys_prompt = (
-                base_prompt
-                + "\n\nThink through the board in <think>...</think> and output your move as a single XML tag, e.g., <move>A1</move>."
-            )
             tasks.append(
                 SingleAgentSyncProtocol(
                     agent=Agent(
                         client=client,
                         model=model,
                         ctx=FullDialog(),
-                        parser=parser,
+                        parser=action_parser,
                     ),
                     prompt=sys_prompt,
                 ).run(
@@ -103,7 +95,7 @@ async def eval_episodes(
             )
 
         batch_rollouts = await asyncio.gather(*tasks)
-        idx += batch_size
+        idx += len(batch_seeds)
         for seed, rollouts in zip(batch_seeds, batch_rollouts):
             step = rollouts[0].steps[-1]
             info = step.info

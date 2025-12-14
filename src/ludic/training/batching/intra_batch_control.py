@@ -39,10 +39,10 @@ class GRPORequestStrategy:
         self.group_size = group_size
         self._rng = random.Random()
 
-    def expand(self, base_requests: List[RolloutRequest]) -> List[RolloutRequest]:
+    def expand(self, requests: List[RolloutRequest]) -> List[RolloutRequest]:
         expanded_requests = []
 
-        for base_req in base_requests:
+        for base_req in requests:
             # 1. Determine the single environment seed for this group.
             #    If the user provided a specific seed, we respect it (lock it for the whole group).
             #    If not, we generate one random seed and lock THAT for the whole group.

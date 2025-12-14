@@ -5,6 +5,7 @@ from .interfaces import (
     WeightMetadata,
 )
 from .publisher import BroadcastPolicyPublisher
+from .adapters import VllmControlPlane, VllmTensorCommunicator, create_vllm_publisher
 
 __all__ = [
     "PolicyPublisher",
@@ -12,4 +13,7 @@ __all__ = [
     "TensorCommunicator",
     "WeightMetadata",
     "BroadcastPolicyPublisher",
+    "VllmControlPlane",
+    "VllmTensorCommunicator",
+    "create_vllm_publisher",
 ]

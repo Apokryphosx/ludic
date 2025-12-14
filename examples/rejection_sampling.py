@@ -7,24 +7,14 @@ from pathlib import Path
 from typing import Dict, Any
 
 from ludic.agent import Agent
-from ludic.context.full_dialog import FullDialog
-from ludic.inference.vllm_client import VLLMChatClient
+from ludic.context import FullDialog
+from ludic.inference import VLLMChatClient
 from ludic.parsers import xml_move_parser
-from ludic.training.rollout_engine import (
-    RolloutEngine,
-    EnvRegistry,
-    ProtocolRegistry,
-)
-from ludic.training.types import (
-    EnvSpec,
-    ProtocolSpec,
-    RolloutRequest,
-)
-from ludic.interaction.single_agent import SingleAgentSyncProtocol
-from ludic.interaction.base import InteractionProtocol
+from ludic.interaction import InteractionProtocol, SingleAgentSyncProtocol
+from ludic.training import RolloutEngine, EnvSpec, ProtocolSpec, RolloutRequest
 from ludic.types import Rollout, SamplingArgs
 
-from envs.tic_tac_toe import TicTacToeEnv
+from environments.tic_tac_toe import TicTacToeEnv
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -108,22 +98,23 @@ async def generate_filtered_data(
     )
 
     # 2. Define Factory Methods
-    def create_single_agent_protocol(system_prompt: str) -> InteractionProtocol:
+    def create_single_agent_protocol(prompt: str) -> InteractionProtocol:
         return SingleAgentSyncProtocol(
             agent=Agent(
                 client=client,           # Shared client
                 model=MODEL_NAME,        # Same model
-                ctx=FullDialog(system_prompt=system_prompt), # FRESH Context
+                ctx=FullDialog(),  # fresh context; prompt is set via protocol
                 parser=xml_move_parser,  # Stateless parser function
-            )
+            ),
+            prompt=prompt,
         )
 
     # 3. Setup Registries
-    env_registry: EnvRegistry = {
+    env_registry = {
         "tictactoe": lambda **kwargs: TicTacToeEnv(**kwargs)
     }
     
-    protocol_registry: ProtocolRegistry = {
+    protocol_registry = {
         "single_agent": create_single_agent_protocol
     }
 
@@ -144,7 +135,7 @@ async def generate_filtered_data(
         env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": True}),
         protocol=ProtocolSpec(
             kind="single_agent", 
-            kwargs={"system_prompt": prompt_text}
+            kwargs={"prompt": prompt_text}
         ),
         num_episodes=episodes // 2,
         sampling_args=sampling_args,
@@ -155,7 +146,7 @@ async def generate_filtered_data(
         env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": False}),
         protocol=ProtocolSpec(
             kind="single_agent", 
-            kwargs={"system_prompt": prompt_text}
+            kwargs={"prompt": prompt_text}
         ),
         num_episodes=episodes - (episodes // 2),
         sampling_args=sampling_args,

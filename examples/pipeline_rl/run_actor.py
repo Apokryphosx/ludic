@@ -2,18 +2,22 @@ import logging
 import asyncio
 
 # Ludic Imports
-from ludic.agents.base_agent import Agent
-from ludic.context.full_dialog import FullDialog
-from ludic.inference.vllm_client import VLLMChatClient
+from ludic.agent import Agent
+from ludic.context import FullDialog
+from ludic.inference import VLLMChatClient
 from ludic.parsers import xml_move_parser
-from ludic.training.batching.rollout_engine import RolloutEngine
-from ludic.training.batching import run_pipeline_actor
-from ludic.training.types import EnvSpec, ProtocolSpec, RolloutRequest
-from ludic.training.algorithm import make_reinforce
-from ludic.interaction.single_agent import SingleAgentSyncProtocol
+from ludic.training import (
+    RolloutEngine,
+    run_pipeline_actor,
+    EnvSpec,
+    ProtocolSpec,
+    RolloutRequest,
+    make_reinforce,
+)
+from ludic.interaction import SingleAgentSyncProtocol
 
 # Env Import
-from examples.envs.tic_tac_toe import TicTacToeEnv
+from environments.tic_tac_toe import TicTacToeEnv
 
 # ---------------------------------------------------------------------------
 # Configuration (Must match Trainer!)
@@ -33,7 +37,7 @@ def create_engine(client: VLLMChatClient) -> RolloutEngine:
     env_registry = {"tictactoe": lambda **kwargs: TicTacToeEnv(**kwargs)}
     
     # 2. Protocol Factory
-    def create_protocol(system_prompt: str = None):
+    def create_protocol(prompt: str | None = None):
         return SingleAgentSyncProtocol(
             agent=Agent(
                 client=client, 
@@ -41,7 +45,7 @@ def create_engine(client: VLLMChatClient) -> RolloutEngine:
                 ctx=FullDialog(), 
                 parser=xml_move_parser
             ),
-            prompt=system_prompt 
+            prompt=prompt,
         )
 
     protocol_registry = {"single_agent": create_protocol}
@@ -64,7 +68,7 @@ def make_requests() -> list[RolloutRequest]:
     
     return [RolloutRequest(
         env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": True}),
-        protocol=ProtocolSpec(kind="single_agent", kwargs={"system_prompt": training_prompt}),
+        protocol=ProtocolSpec(kind="single_agent", kwargs={"prompt": training_prompt}),
         sampling_args=sampling_args, 
         num_episodes=1, 
     )]

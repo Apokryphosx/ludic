@@ -21,23 +21,26 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import get_peft_model, LoraConfig, TaskType
 
 from environments.tic_tac_toe import TicTacToeEnv
-from ludic.agents.base_agent import Agent
-from ludic.context.full_dialog import FullDialog
+from ludic.agent import Agent
+from ludic.context import FullDialog
+from ludic.inference import VLLMChatClient
+from ludic.interaction import SingleAgentSyncProtocol
 from ludic.distributed.adapters import create_vllm_publisher
-from ludic.inference.vllm_client import VLLMChatClient
-from ludic.interaction.single_agent import SingleAgentSyncProtocol
 from ludic.parsers import compose_parsers, cot_prefix_parser, xml_move_parser
-from ludic.training.algorithm import RLAlgorithm
-from ludic.training.batching.rollout_engine import RolloutEngine
-from ludic.training.batching.synced_batching import RolloutBatchSource
-from ludic.training.credit_assignment import GroupNormalizedReturn
-from ludic.training.loss import ReinforceLoss
-from ludic.training.trainer import Trainer
-from ludic.training.config import TrainerConfig
-from ludic.training.checkpoint import CheckpointConfig
-from ludic.training.types import EnvSpec, ProtocolSpec, RolloutRequest
-from ludic.training.stats import Reducer
-from ludic.training.loggers import RichLiveLogger
+from ludic.training import (
+    RLAlgorithm,
+    RolloutEngine,
+    RolloutBatchSource,
+    Trainer,
+    TrainerConfig,
+    CheckpointConfig,
+    EnvSpec,
+    ProtocolSpec,
+    RolloutRequest,
+    GroupNormalizedReturn,
+    ReinforceLoss,
+)
+from ludic.training import Reducer, RichLiveLogger
 
 # Compose parsers to strip optional <think>...</think> and then require <move>...</move>.
 TICTACTOE_PARSER = compose_parsers(cot_prefix_parser, xml_move_parser)

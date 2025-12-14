@@ -4,24 +4,15 @@ import asyncio
 from pathlib import Path
 from typing import List
 
-from ludic.agents.base_agent import Agent
-from ludic.context.full_dialog import FullDialog
-from ludic.inference.vllm_client import VLLMChatClient
+from ludic.agent import Agent
+from ludic.context import FullDialog
+from ludic.inference import VLLMChatClient
+from ludic.interaction import SingleAgentSyncProtocol
 from ludic.parsers import xml_move_parser
-from ludic.training.batching.rollout_engine import (
-    RolloutEngine,
-    EnvRegistry,
-    CtxRegistry,
-)
-from ludic.training.types import (
-    CtxSpec,
-    EnvSpec,
-    RolloutRequest,
-)
+from ludic.training import RolloutEngine, EnvSpec, ProtocolSpec, RolloutRequest
 from ludic.types import Rollout, SamplingArgs
 
-# Adjust this import path to where your env actually is
-from envs.tic_tac_toe import TicTacToeEnv
+from environments.tic_tac_toe import TicTacToeEnv
 
 
 # ---------------------------------------------------------------------------
@@ -56,30 +47,7 @@ Do not include any other text, commentary, or tags.
 """
     return (base.rstrip() + "\n\n" + extra.strip()).strip()
 
-
-# ---------------------------------------------------------------------------
-# Agent
-# ---------------------------------------------------------------------------
-
-def build_agent() -> Agent:
-    """
-    Standard Ludic Agent backed by a VLLMChatClient.
-    Expects a vLLM server already running with an OpenAI-compatible API.
-    """
-    client = VLLMChatClient(
-        host=VLLM_HOST,
-        port=VLLM_PORT,
-        connection_timeout_s=300.0,  # generous for first model load
-        enable_weight_updates=False,
-    )
-    return Agent(client=client, model=MODEL_NAME)
-
-
-# ---------------------------------------------------------------------------
-# Registries
-# ---------------------------------------------------------------------------
-
-def make_env_registry() -> EnvRegistry:
+def make_env_registry():
     """
     Two logically different Tic-Tac-Toe envs:
 
@@ -102,17 +70,8 @@ def make_env_registry() -> EnvRegistry:
     }
 
 
-def make_ctx_registry() -> CtxRegistry:
-    """
-    Single context kind using the built-in FullDialog context.
-    """
-    return {
-        "full_dialog": lambda **kwargs: FullDialog(**kwargs),
-    }
-
-
 # ---------------------------------------------------------------------------
-# Rollout request factory (with XML parser wired in)
+# Rollout request factory
 # ---------------------------------------------------------------------------
 
 def make_rollout_requests() -> List[RolloutRequest]:
@@ -136,14 +95,9 @@ def make_rollout_requests() -> List[RolloutRequest]:
             kind="ttt_agent_first",
             kwargs={},
         ),
-        ctx=CtxSpec(
-            kind="full_dialog",
-            kwargs={},
-        ),
+        protocol=ProtocolSpec(kind="single_agent", kwargs={"prompt": system_prompt}),
         num_episodes=3,
         sampling_args=sampling_args,
-        system_prompt=system_prompt,
-        action_parser=xml_move_parser,  # <-- XML action parser here
         meta={"label": "agent_first"},
     )
 
@@ -152,14 +106,9 @@ def make_rollout_requests() -> List[RolloutRequest]:
             kind="ttt_opponent_first",
             kwargs={},
         ),
-        ctx=CtxSpec(
-            kind="full_dialog",
-            kwargs={},
-        ),
+        protocol=ProtocolSpec(kind="single_agent", kwargs={"prompt": system_prompt}),
         num_episodes=3,
         sampling_args=sampling_args,
-        system_prompt=system_prompt,
-        action_parser=xml_move_parser,  # <-- same XML parser
         meta={"label": "opponent_first"},
     )
 
@@ -244,16 +193,33 @@ async def main() -> None:
         f"using model {MODEL_NAME}..."
     )
 
-    agent = build_agent()
-    env_registry: EnvRegistry = make_env_registry()
-    ctx_registry: CtxRegistry = make_ctx_registry()
+    client = VLLMChatClient(
+        host=VLLM_HOST,
+        port=VLLM_PORT,
+        connection_timeout_s=300.0,
+        enable_weight_updates=False,
+    )
+
+    env_registry = make_env_registry()
+
+    def create_protocol(prompt: str | None = None):
+        return SingleAgentSyncProtocol(
+            agent=Agent(
+                client=client,
+                model=MODEL_NAME,
+                ctx=FullDialog(),
+                parser=xml_move_parser,
+            ),
+            prompt=prompt,
+        )
+
+    protocol_registry = {"single_agent": create_protocol}
 
     JSONL_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     engine = RolloutEngine(
-        agent=agent,
         env_registry=env_registry,
-        ctx_registry=ctx_registry,
+        protocol_registry=protocol_registry,
         jsonl_path=str(JSONL_PATH),
     )
 

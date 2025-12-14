@@ -27,24 +27,24 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset  # type: ignore
 
 from environments.math import MATHEnv
-from ludic.agents.base_agent import Agent
-from ludic.context.full_dialog import FullDialog
+from ludic.agent import Agent
+from ludic.context import FullDialog
+from ludic.inference import VLLMChatClient
+from ludic.interaction import SingleAgentSyncProtocol
 from ludic.distributed.adapters import create_vllm_publisher
-from ludic.inference.vllm_client import VLLMChatClient
-from ludic.interaction.single_agent import SingleAgentSyncProtocol
 from ludic.parsers import boxed_parser, compose_parsers, cot_prefix_parser, extract_last_boxed_content
-from ludic.training.algorithm import RLAlgorithm
-from ludic.training.batching.rollout_engine import RolloutEngine
-from ludic.training.batching.synced_batching import RolloutBatchSource
-from ludic.training.batching.intra_batch_control import GRPORequestStrategy
-from ludic.training.credit_assignment import GroupNormalizedReturn
-from ludic.training.loss import ReinforceLoss
-from ludic.training.trainer import Trainer
-from ludic.training.config import TrainerConfig
-from ludic.training.checkpoint import CheckpointConfig
-from ludic.training.types import EnvSpec, ProtocolSpec, RolloutRequest
-from ludic.training.stats import Reducer
-from ludic.training.loggers import RichLiveLogger
+from ludic.training import (
+    RLAlgorithm,
+    RolloutEngine,
+    RolloutBatchSource,
+    Trainer,
+    TrainerConfig,
+    CheckpointConfig,
+    make_dataset_queue_requests_fn,
+    GroupNormalizedReturn,
+    ReinforceLoss,
+)
+from ludic.training import Reducer, RichLiveLogger
 
 
 class _NoopPublisher:
@@ -200,36 +200,6 @@ def load_math_eval(limit: int | None) -> List[Dict[str, Any]]:
     return samples
 
 
-def build_requests_fn(
-    samples_q: queue.Queue,
-    batch_size: int,
-    sampling_args: Dict[str, Any],
-    *,
-    group_size: int,
-):
-    def _fn() -> List[RolloutRequest]:
-        reqs: List[RolloutRequest] = []
-        for _ in range(batch_size):
-            if samples_q.empty():
-                break
-            idx, sample = samples_q.get()
-            reqs.append(
-                RolloutRequest(
-                    env=EnvSpec(kind="math", kwargs={"sample": sample}),
-                    protocol=ProtocolSpec(kind="single_agent", kwargs={}),
-                    num_episodes=1,
-                    seed=int(idx),
-                    sampling_args=sampling_args,
-                )
-            )
-        if not reqs:
-            return []
-        strategy = GRPORequestStrategy(group_size=group_size)
-        return strategy.expand(reqs)
-
-    return _fn
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
@@ -370,7 +340,22 @@ def main() -> None:
         "max_tokens": args.max_tokens,
         "extras": {"extra_body": {"return_token_ids": True}},
     }
-    requests_fn = build_requests_fn(samples_q, args.batch_size, sampling_args, group_size=args.group_size)
+    requests_fn = make_dataset_queue_requests_fn(
+        samples_q,
+        batch_size=args.batch_size,
+        env_kind="math",
+        protocol_kind="single_agent",
+        sampling_args=sampling_args,
+        protocol_kwargs={},
+        request_meta_fn=lambda idx, sample: {
+            "sample_index": idx,
+            "problem_id": sample.get("id", idx),
+            "level": sample.get("level"),
+            "type": sample.get("type"),
+        },
+        seed_fn=lambda idx, _sample: idx,
+        group_size=args.group_size,
+    )
     batch_source = RolloutBatchSource(
         orchestrator=engine,
         credit_assigner=algo.credit_assigner,
@@ -410,7 +395,7 @@ def main() -> None:
         if args.logger == "none":
             train_logger = None
         elif args.logger == "print" or not sys.stdout.isatty():
-            from ludic.training.loggers import PrintLogger
+            from ludic.training import PrintLogger
 
             train_logger = PrintLogger(
                 prefix="[trainer]",

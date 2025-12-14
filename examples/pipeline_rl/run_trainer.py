@@ -10,12 +10,9 @@ from rich.table import Table
 from rich import box
 
 # Ludic Imports
-from ludic.inference.vllm_client import VLLMChatClient
-from ludic.training.batching import PipelineBatchSource
-from ludic.training.algorithm import make_reinforce
-from ludic.training.trainer import Trainer
-from ludic.training.config import TrainerConfig
+from ludic.inference import VLLMChatClient
 from ludic.distributed.adapters import create_vllm_publisher
+from ludic.training import PipelineBatchSource, make_reinforce, Trainer, TrainerConfig
 
 # ---------------------------------------------------------------------------
 # Configuration (Must match Actor!)

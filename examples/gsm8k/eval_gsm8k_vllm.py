@@ -22,15 +22,14 @@ import signal
 import subprocess
 from typing import List, Sequence, Dict
 
-from ludic.agents.base_agent import Agent
-from ludic.context.full_dialog import FullDialog
-from ludic.inference.vllm_client import VLLMChatClient
-from ludic.inference.vllm_utils import start_vllm_server, wait_for_vllm_health
-from ludic.interaction.single_agent import SingleAgentSyncProtocol
+from ludic.agent import Agent
+from ludic.context import FullDialog
+from ludic.inference import VLLMChatClient, start_vllm_server, wait_for_vllm_health
+from ludic.interaction import SingleAgentSyncProtocol
 from ludic.parsers import ParseResult, cot_prefix_parser
 from ludic.types import SamplingArgs
 from environments.gsm8k import GSM8KEnv
-from ludic.training.stats import Reducer, apply_reducers_to_records
+from ludic.training import Reducer, apply_reducers_to_records
 
 
 def load_gsm8k(split: str, limit: int | None) -> List[dict]:
