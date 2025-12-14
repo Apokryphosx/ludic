@@ -81,6 +81,21 @@ def _get(cfg: Mapping[str, Any], key: str, default: Any) -> Any:
     return cur
 
 
+def _normalize_resume_from(v: Any) -> int | str | None:
+    if v is None:
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "" or s.lower() == "null":
+            return None
+        if s.isdigit():
+            return int(s)
+        return s
+    raise TypeError(f"checkpoint.resume_from must be int, str, or empty; got {type(v)}")
+
+
 def _configure_logging(*, rank: int, level: str) -> None:
     numeric = getattr(logging, level.upper(), logging.INFO)
     logging.basicConfig(
@@ -472,7 +487,7 @@ def main() -> None:
         checkpoint_config=checkpoint_cfg,
         train_logger=train_logger,
         reducers=reducers,
-        resume_from=_get(cfg, "checkpoint.resume_from", None),
+        resume_from=_normalize_resume_from(_get(cfg, "checkpoint.resume_from", None)),
     )
 
     # ---- eval config ----
