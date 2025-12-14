@@ -45,6 +45,82 @@ from ludic.training import Reducer, RichLiveLogger
 # STRICT: require <think>...</think> then exactly one <move>...</move>.
 TICTACTOE_PARSER = compose_parsers(think_prefix_parser, xml_tag_parser("move", exact=True))
 
+
+def _load_toml_config(path: str) -> Dict[str, Any]:
+    try:
+        import tomllib  # py>=3.11
+    except ModuleNotFoundError as e:  # pragma: no cover
+        raise RuntimeError(
+            "TOML config requested but `tomllib` is unavailable; use Python 3.11+ or vendor a TOML parser."
+        ) from e
+
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+
+    # Allow either a flat config file or a sectioned one.
+    if isinstance(data.get("train"), dict):
+        return dict(data["train"])
+    return dict(data)
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train a model on Tic-Tac-Toe using Ludic + vLLM.")
+    parser.add_argument(
+        "--config-file",
+        type=str,
+        default=None,
+        help="Path to a TOML file with defaults for all flags (supports either flat keys or a [train] table).",
+    )
+    parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--seed", type=int, default=0, help="Base RNG seed for sampling episode seeds.")
+    parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=4, help="Rollout requests per batch source call.")
+    parser.add_argument("--train-steps", type=int, default=100)
+    parser.add_argument("--max-steps-per-episode", type=int, default=5)
+    parser.add_argument(
+        "--lora-rank",
+        type=int,
+        default=16,
+        help="LoRA rank (RL-friendly defaults from LoRA best-practice guides).",
+    )
+    parser.add_argument(
+        "--lora-alpha-mult",
+        type=float,
+        default=2.0,
+        help="Multiplier applied to rank to set lora_alpha (alpha = rank * mult).",
+    )
+    parser.add_argument("--lora-dropout", type=float, default=0.0, help="LoRA dropout probability.")
+    parser.add_argument("--train-temperature", type=float, default=1.0, help="Sampling temperature for training rollouts.")
+    parser.add_argument("--eval-every", type=int, default=10, help="Eval every N train steps.")
+    parser.add_argument(
+        "--eval-before-start",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run eval once before training begins.",
+    )
+    parser.add_argument("--eval-episodes", type=int, default=200, help="Number of episodes for eval.")
+    parser.add_argument("--eval-concurrency", type=int, default=32)
+    parser.add_argument("--eval-temperature", type=float, default=0.6, help="Sampling temperature for eval passes.")
+    parser.add_argument("--rollout-log", type=str, default="tictactoe_train_rollouts.jsonl")
+    return parser
+
+
+def _parse_args() -> argparse.Namespace:
+    base = argparse.ArgumentParser(add_help=False)
+    base.add_argument("--config-file", type=str, default=None)
+    cfg_args, remaining = base.parse_known_args()
+
+    parser = _build_arg_parser()
+    if cfg_args.config_file:
+        config = _load_toml_config(cfg_args.config_file)
+        # CLI flags still override config values.
+        parser.set_defaults(**config)
+
+    return parser.parse_args(remaining)
+
+
 async def run_eval(
     *,
     seeds: List[int],
@@ -119,31 +195,7 @@ def build_requests_fn(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train a model on Tic-Tac-Toe using Ludic + vLLM.")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--seed", type=int, default=0, help="Base RNG seed for sampling episode seeds.")
-    parser.add_argument("--concurrency", type=int, default=8)
-    parser.add_argument("--batch-size", type=int, default=4, help="Rollout requests per batch source call.")
-    parser.add_argument("--train-steps", type=int, default=100)
-    parser.add_argument("--max-steps-per-episode", type=int, default=5)
-    parser.add_argument("--lora-rank", type=int, default=16, help="LoRA rank (RL-friendly defaults from LoRA best-practice guides).")
-    parser.add_argument(
-        "--lora-alpha-mult",
-        type=float,
-        default=2.0,
-        help="Multiplier applied to rank to set lora_alpha (alpha = rank * mult).",
-    )
-    parser.add_argument("--lora-dropout", type=float, default=0.0, help="LoRA dropout probability.")
-    parser.add_argument("--train-temperature", type=float, default=1.0, help="Sampling temperature for training rollouts.")
-    parser.add_argument("--eval-every", type=int, default=10, help="Eval every N train steps.")
-    parser.add_argument("--eval-before-start", action="store_true", default=True, help="Run eval once before training begins.")
-    parser.add_argument("--eval-episodes", type=int, default=200, help="Number of episodes for eval.")
-    parser.add_argument("--eval-concurrency", type=int, default=32)
-    parser.add_argument("--eval-temperature", type=float, default=0.6, help="Sampling temperature for eval passes.")
-    parser.add_argument("--rollout-log", type=str, default="tictactoe_train_rollouts.jsonl")
-    args = parser.parse_args()
+    args = _parse_args()
 
     rollout_log_path = os.path.abspath(args.rollout_log)
     os.makedirs(os.path.dirname(rollout_log_path) or ".", exist_ok=True)

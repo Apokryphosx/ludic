@@ -1,0 +1,40 @@
+# examples/tic_tac_toe/config.toml
+
+[train]
+model = "Qwen/Qwen2.5-7B-Instruct"
+host = "127.0.0.1"
+port = 8000
+
+seed = 0
+concurrency = 8
+batch_size = 4
+train_steps = 300
+max_steps_per_episode = 5
+
+lora_rank = 16
+lora_alpha_mult = 2.0
+lora_dropout = 0.0
+
+train_temperature = 1.0
+
+eval_every = 10
+eval_before_start = true
+eval_episodes = 200
+eval_concurrency = 32
+eval_temperature = 0.6
+
+rollout_log = "tictactoe_train_rollouts.jsonl"
+
+[eval]
+model = "Qwen/Qwen2.5-7B-Instruct"
+host = "127.0.0.1"
+port = 8000
+
+start_server = false
+episodes = 200
+temperature = 0.6
+max_tokens = 250
+timeout_s = 30.0
+out = "tictactoe_eval.jsonl"
+concurrency = 32
+max_steps = 5

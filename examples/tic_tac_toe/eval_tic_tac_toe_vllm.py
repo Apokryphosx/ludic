@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import signal
 import subprocess
+from contextlib import nullcontext
 from typing import List, Dict
 
 from ludic.agent import Agent
@@ -19,7 +20,82 @@ from ludic.interaction import SingleAgentSyncProtocol
 from ludic.parsers import compose_parsers, think_prefix_parser, xml_tag_parser
 from ludic.types import SamplingArgs
 from environments.tic_tac_toe import TicTacToeEnv
-from ludic.training import Reducer, apply_reducers_to_records
+from ludic.training import Reducer, RichLiveLogger, apply_reducers_to_records
+
+
+def _load_toml_config(path: str) -> Dict:
+    try:
+        import tomllib  # py>=3.11
+    except ModuleNotFoundError as e:  # pragma: no cover
+        raise RuntimeError(
+            "TOML config requested but `tomllib` is unavailable; use Python 3.11+ or vendor a TOML parser."
+        ) from e
+
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+
+    # Allow either a flat config file or a sectioned one.
+    if isinstance(data.get("eval"), dict):
+        return dict(data["eval"])
+    return dict(data)
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Start a vLLM server (optional) and evaluate a model on Tic-Tac-Toe.")
+    parser.add_argument(
+        "--config-file",
+        type=str,
+        default=None,
+        help="Path to a TOML file with defaults for all flags (supports either flat keys or an [eval] table).",
+    )
+    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--start-server",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If set, launch a local vLLM server for the chosen model before eval.",
+    )
+    parser.add_argument("--episodes", type=int, default=200, help="Number of episodes to run.")
+    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--max-tokens", type=int, default=250)
+    parser.add_argument("--timeout-s", type=float, default=None, help="Per-call timeout.")
+    parser.add_argument(
+        "--rich",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use Rich live logger for progress output.",
+    )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default="tictactoe_eval.jsonl",
+        help="Path to write rollout results as JSONL.",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=32,
+        help="Number of parallel episodes to run.",
+    )
+    parser.add_argument("--max-steps", type=int, default=5, help="Max steps per episode.")
+    return parser
+
+
+def _parse_args() -> argparse.Namespace:
+    base = argparse.ArgumentParser(add_help=False)
+    base.add_argument("--config-file", type=str, default=None)
+    cfg_args, remaining = base.parse_known_args()
+
+    parser = _build_arg_parser()
+    if cfg_args.config_file:
+        config = _load_toml_config(cfg_args.config_file)
+        # CLI flags still override config values.
+        parser.set_defaults(**config)
+
+    return parser.parse_args(remaining)
+
 
 async def eval_episodes(
     *,
@@ -32,6 +108,7 @@ async def eval_episodes(
     timeout_s: float | None,
     max_steps: int,
     concurrency: int = 1,
+    rich: bool = True,
 ) -> List[dict]:
     action_parser = compose_parsers(think_prefix_parser, xml_tag_parser("move", exact=True))
     reducers: Dict[str, Reducer] = {
@@ -61,6 +138,8 @@ async def eval_episodes(
     losses = 0
     draws = 0
     parse_errors = 0
+    illegal_episodes = 0
+    total_completion_tokens = 0
     records: List[dict] = []
 
     base_env = TicTacToeEnv(agent_starts=True)
@@ -70,67 +149,113 @@ async def eval_episodes(
         + "\n\nThink through the board in <think>...</think>. After </think>, output exactly one XML tag of the form <move>A1</move> and nothing else."
     )
 
+    logger = None
+    if rich:
+        logger = RichLiveLogger(
+            keys=[
+                "episodes_done",
+                "episodes_total",
+                "win_rate",
+                "loss_rate",
+                "draw_rate",
+                "illegal_ep_rate",
+                "parse_err_ep_rate",
+                "avg_completion_length",
+                "total_completion_tokens",
+            ],
+            spark_key="win_rate",
+            history=100,
+            precision=4,
+        )
+
+    def _log_progress() -> None:
+        if logger is None:
+            return
+        denom = total if total else 1
+        logger.log(
+            total,
+            {
+                "episodes_done": float(total),
+                "episodes_total": float(len(seeds)),
+                "win_rate": 100.0 * wins / denom,
+                "loss_rate": 100.0 * losses / denom,
+                "draw_rate": 100.0 * draws / denom,
+                "illegal_ep_rate": 100.0 * illegal_episodes / denom,
+                "parse_err_ep_rate": 100.0 * parse_errors / denom,
+                "avg_completion_length": float(total_completion_tokens) / denom,
+                "total_completion_tokens": float(total_completion_tokens),
+            },
+        )
+
     idx = 0
-    while idx < len(seeds):
-        batch_seeds = seeds[idx : idx + concurrency]
-        tasks = []
-        for seed in batch_seeds:
-            env = TicTacToeEnv(agent_starts=True)
-            tasks.append(
-                SingleAgentSyncProtocol(
-                    agent=Agent(
-                        client=client,
-                        model=model,
-                        ctx=FullDialog(),
-                        parser=action_parser,
-                    ),
-                    prompt=sys_prompt,
-                ).run(
-                    env=env,
-                    max_steps=max_steps,
-                    seed=seed,
-                    sampling_args=sargs,
-                    timeout_s=timeout_s,
+    with (logger if logger is not None else nullcontext()):
+        while idx < len(seeds):
+            batch_seeds = seeds[idx : idx + concurrency]
+            tasks = []
+            for seed in batch_seeds:
+                env = TicTacToeEnv(agent_starts=True)
+                tasks.append(
+                    SingleAgentSyncProtocol(
+                        agent=Agent(
+                            client=client,
+                            model=model,
+                            ctx=FullDialog(),
+                            parser=action_parser,
+                        ),
+                        prompt=sys_prompt,
+                    ).run(
+                        env=env,
+                        max_steps=max_steps,
+                        seed=seed,
+                        sampling_args=sargs,
+                        timeout_s=timeout_s,
+                    )
                 )
-            )
 
-        batch_rollouts = await asyncio.gather(*tasks)
-        idx += len(batch_seeds)
-        for seed, rollouts in zip(batch_seeds, batch_rollouts):
-            step = rollouts[0].steps[-1]
-            info = step.info
+            batch_rollouts = await asyncio.gather(*tasks)
+            idx += len(batch_seeds)
+            for seed, rollouts in zip(batch_seeds, batch_rollouts):
+                step = rollouts[0].steps[-1]
+                info = step.info
 
-            total += 1
-            result = info.get("result")
-            if result == "win":
-                wins += 1
-            elif result == "loss":
-                losses += 1
-            elif result == "draw":
-                draws += 1
-            if info.get("parse_error") or step.truncated:
-                parse_errors += 1
+                total += 1
+                result = info.get("result")
+                if result == "win":
+                    wins += 1
+                elif result == "loss":
+                    losses += 1
+                elif result == "draw":
+                    draws += 1
 
-            completion_ids = info.get("completion_token_ids") or []
+                if info.get("illegal_move"):
+                    illegal_episodes += 1
+                if info.get("parse_error") or step.truncated:
+                    parse_errors += 1
 
-            records.append(
-                {
-                    "seed": seed,
-                    "first_obs": rollouts[0].steps[0].prev_obs,
-                    "raw_action": step.action,
-                    "parsed_action": info.get("parsed_action"),
-                    "result": result,
-                    "illegal_move": info.get("illegal_move"),
-                    "parse_error": info.get("parse_error"),
-                    "reward": step.reward,
-                    "truncated": step.truncated,
-                    "terminated": step.terminated,
-                    "completion_length": len(completion_ids) if isinstance(completion_ids, list) else 0,
-                }
-            )
+                completion_ids = info.get("completion_token_ids") or []
+                completion_len = len(completion_ids) if isinstance(completion_ids, list) else 0
+                total_completion_tokens += completion_len
 
-        win_rate = 100 * wins / total
-        print(f"[{total}/{len(seeds)}] win_rate={win_rate:.2f}% parse_errors={parse_errors}")
+                records.append(
+                    {
+                        "seed": seed,
+                        "first_obs": rollouts[0].steps[0].prev_obs,
+                        "raw_action": step.action,
+                        "parsed_action": info.get("parsed_action"),
+                        "result": result,
+                        "illegal_move": info.get("illegal_move"),
+                        "parse_error": info.get("parse_error"),
+                        "reward": step.reward,
+                        "truncated": step.truncated,
+                        "terminated": step.terminated,
+                        "completion_length": completion_len,
+                    }
+                )
+
+            _log_progress()
+            if logger is None:
+                win_rate = 100 * wins / total
+                print(f"[{total}/{len(seeds)}] win_rate={win_rate:.2f}% parse_errors={parse_errors}")
 
     win_rate = 100 * wins / total if total else 0.0
     loss_rate = 100 * losses / total if total else 0.0
@@ -150,34 +275,7 @@ async def eval_episodes(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Start a vLLM server (optional) and evaluate a model on Tic-Tac-Toe.")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--host", type=str, default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument(
-        "--start-server",
-        action="store_true",
-        help="If set, launch a local vLLM server for the chosen model before eval.",
-    )
-    parser.add_argument("--episodes", type=int, default=200, help="Number of episodes to run.")
-    parser.add_argument("--temperature", type=float, default=0.6)
-    parser.add_argument("--max-tokens", type=int, default=250)
-    parser.add_argument("--timeout-s", type=float, default=None, help="Per-call timeout.")
-    parser.add_argument(
-        "--out",
-        type=str,
-        default="tictactoe_eval.jsonl",
-        help="Path to write rollout results as JSONL.",
-    )
-    parser.add_argument(
-        "--concurrency",
-        type=int,
-        default=32,
-        help="Number of parallel episodes to run.",
-    )
-    parser.add_argument("--max-steps", type=int, default=5, help="Max steps per episode.")
-
-    args = parser.parse_args()
+    args = _parse_args()
 
     seeds = list(range(args.episodes))
     print(f"Prepared {len(seeds)} Tic-Tac-Toe episodes (seeded).")
@@ -206,6 +304,7 @@ def main() -> None:
                 timeout_s=args.timeout_s,
                 max_steps=args.max_steps,
                 concurrency=args.concurrency,
+                rich=args.rich,
             )
         )
         if records:
