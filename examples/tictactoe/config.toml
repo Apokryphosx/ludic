@@ -23,7 +23,7 @@ seed = 0
 temperature = 1.0
 max_tokens = 250
 max_steps_per_episode = 5
-batch_size = 2                 # requests per batch-source call (per rank)
+batch_size = 4                 # requests per batch-source call (per rank)
 concurrency = 8                # concurrent rollouts (per rank)
 jsonl_path = "tictactoe_train_rollouts.jsonl"
 
@@ -32,9 +32,9 @@ gamma = 1.0
 normalize_advantages = true
 
 [trainer]
-train_steps = 100
+train_steps = 500
 lr = 5e-5
-weight_decay = 0.01
+weight_decay = 0.0
 grad_accum_steps = 8
 max_grad_norm = 0.5
 sync_every_steps = 1          # how often to push updated weights to vLLM
@@ -60,10 +60,22 @@ timeout_s = ""                 # float seconds (e.g. "30"), or "" to disable
 max_model_param_gb = 16        # abort if model params (on CUDA) exceed this
 
 [logging]
-level = "DEBUG"
+level = "INFO"
 rank0_only_output = true
-logger = "print"               # "print", "rich", or "none"
+logger = "wandb"               # "print", "rich", "wandb", or "none"
 gpu_memory = true
 vram_breakdown = true
 history = 100
 precision = 4
+
+[wandb]
+# Requires `wandb` installed and (usually) `WANDB_API_KEY` set.
+# To run without internet, set `mode="offline"` (or env `WANDB_MODE=offline`).
+project = "ludic"
+entity = "default"
+name = "tictactoe-rl-lora-5d9c1b"
+group = "tictactoe-rl"
+job_type = "tictactoe_rl_lora"
+tags = ["tictactoe", "rl", "lora"]
+notes = "auto-default run"
+mode = ""  # "", "online", "offline", or "disabled"

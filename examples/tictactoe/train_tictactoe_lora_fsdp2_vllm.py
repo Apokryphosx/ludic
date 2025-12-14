@@ -52,7 +52,7 @@ from ludic.training.checkpoint import CheckpointConfig
 from ludic.training.config import TrainerConfig
 from ludic.training.credit_assignment import MonteCarloReturn
 from ludic.training.loss import ReinforceBaselineLoss
-from ludic.training.loggers import PrintLogger, RichLiveLogger
+from ludic.training.loggers import PrintLogger, RichLiveLogger, WandbLogger
 from ludic.training.stats import Reducer
 from ludic.training.trainer import Trainer
 from ludic.training.types import EnvSpec, ProtocolSpec, RolloutRequest
@@ -755,6 +755,31 @@ def main() -> None:
 
         if logger_kind == "none":
             train_logger = None
+        elif logger_kind == "wandb":
+            wandb_cfg = _get(cfg, "wandb", {}) or {}
+            if not isinstance(wandb_cfg, Mapping):
+                raise TypeError(f"[wandb] must be a table, got {type(wandb_cfg)}")
+
+            init_kwargs: Dict[str, Any] = {
+                "project": _get(wandb_cfg, "project", "ludic"),
+                "entity": _get(wandb_cfg, "entity", None),
+                "name": _get(wandb_cfg, "name", None),
+                "group": _get(wandb_cfg, "group", None),
+                "job_type": _get(wandb_cfg, "job_type", None),
+                "tags": _get(wandb_cfg, "tags", None),
+                "notes": _get(wandb_cfg, "notes", None),
+            }
+            # Drop Nones to keep wandb.init clean.
+            init_kwargs = {k: v for k, v in init_kwargs.items() if v not in (None, "")}
+
+            # Optional: let the user set WANDB_MODE=offline/disabled via env; also support config.
+            mode = _get(wandb_cfg, "mode", None)
+            if isinstance(mode, str) and mode.strip():
+                os.environ.setdefault("WANDB_MODE", mode.strip())
+
+            # Attach the full TOML config for reproducibility (must be JSON-serializable).
+            init_kwargs["config"] = cfg
+            train_logger = WandbLogger(init_kwargs=init_kwargs)
         elif logger_kind == "rich" and sys.stdout.isatty():
             train_logger = RichLiveLogger(
                 keys=keys,
