@@ -77,6 +77,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0, help="Base RNG seed for sampling episode seeds.")
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=4, help="Rollout requests per batch source call.")
+    parser.add_argument(
+        "--group-size",
+        type=int,
+        default=None,
+        help="Number of rollouts per GRPO group (defaults to --batch-size).",
+    )
     parser.add_argument("--train-steps", type=int, default=100)
     parser.add_argument("--max-steps-per-episode", type=int, default=5)
     parser.add_argument(
@@ -178,8 +184,11 @@ def build_requests_fn(
 ):
     def _fn() -> List[RolloutRequest]:
         reqs: List[RolloutRequest] = []
+        # GRPO-style grouping: sample multiple rollouts for the same env seed/prompt
+        # so GroupNormalizedReturn can compute a within-group baseline.
+        seed = int(torch.randint(0, 2**31 - 1, (1,), generator=rng).item())
+        group_id = f"tictactoe_seed_{seed}"
         for _ in range(batch_size):
-            seed = int(torch.randint(0, 2**31 - 1, (1,), generator=rng).item())
             reqs.append(
                 RolloutRequest(
                     env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": True}),
@@ -187,6 +196,7 @@ def build_requests_fn(
                     num_episodes=1,
                     seed=int(seed),
                     sampling_args=sampling_args,
+                    meta={"group_id": group_id},
                 )
             )
         return reqs
@@ -256,9 +266,10 @@ def main():
     protocol_registry = {"single_agent": protocol_factory}
 
     # Algorithm
+    group_size = int(args.group_size) if args.group_size is not None else int(args.batch_size)
     algo = RLAlgorithm(
         name="grpo",
-        credit_assigner=GroupNormalizedReturn(normalize_adv=True),
+        credit_assigner=GroupNormalizedReturn(group_size=group_size, normalize_adv=True),
         loss=ReinforceLoss(length_normalize=True),
     )
 
