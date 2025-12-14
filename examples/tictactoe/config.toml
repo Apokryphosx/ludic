@@ -56,7 +56,7 @@ temperature = 0.6
 timeout_s = ""                 # float seconds (e.g. "30"), or "" to disable
 
 [preflight]
-max_model_param_gb = 20        # abort if model params (on CUDA) exceed this
+max_model_param_gb = 16        # abort if model params (on CUDA) exceed this
 
 [logging]
 level = "DEBUG"
