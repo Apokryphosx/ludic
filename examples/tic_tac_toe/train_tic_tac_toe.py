@@ -80,8 +80,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1, help="Rollout requests per batch source call.")
     parser.add_argument("--train-steps", type=int, default=100, help="Number of trainer steps.")
     parser.add_argument("--max-steps-per-episode", type=int, default=5)
-    parser.add_argument("--group-size", type=int, default=8, help="Group size for grouped advantages (GRPO-style).")
-    parser.add_argument("--lora-rank", type=int, default=16, help="LoRA rank (RL-friendly defaults from LoRA best-practice guides).")
+    parser.add_argument("--group-size", type=int, default=4, help="Group size for grouped advantages (GRPO-style).")
+    parser.add_argument("--lora-rank", type=int, default=6, help="LoRA rank (RL-friendly defaults from LoRA best-practice guides).")
     parser.add_argument(
         "--lora-alpha-mult",
         type=float,
@@ -148,10 +148,10 @@ def main():
             agent=Agent(
                 client=client,
                 model=args.model,
-                ctx=FullDialog(),
+                ctx=FullDialog(system_prompt=prompt),
                 parser=TICTACTOE_PARSER,
             ),
-            prompt=prompt,
+            stop_on_parse_error=True,
         )
 
     protocol_registry = {"single_agent": protocol_factory}
@@ -172,8 +172,8 @@ def main():
     sampling_args = {
         "temperature": args.train_temperature,
         "max_tokens": 250,
-        # Ask vLLM for token IDs + sampled logprobs so we can use rollout-time behavior logprobs.
-        "extras": {"extra_body": {"return_token_ids": True, "return_logprobs": True}},
+        # Ask vLLM for token IDs.
+        "extras": {"extra_body": {"return_token_ids": True}},
     }
     base_requests_fn = build_requests_fn(rng, args.batch_size, sampling_args)
     # Expand each logical request into a group with shared env seed and diverse sampling seeds.
@@ -191,7 +191,7 @@ def main():
     # Trainer
     cfg = TrainerConfig(
         model_device="cuda" if torch.cuda.is_available() else "cpu",
-        grad_accum_steps=8,
+        grad_accum_steps=4,
         max_grad_norm=0.5,
         pad_token_id=tokenizer.pad_token_id,
         lr=5e-5,
@@ -229,6 +229,27 @@ def main():
             kind="count_true",
             source="illegal_move",
             normalize_by="rollouts",
+            as_percent=True,
+        ),
+        "parse_error_rate": Reducer(
+            kind="count_true",
+            source="parse_error",
+            normalize_by="rollouts",
+            as_percent=True,
+        ),
+        "truncated_rate": Reducer(
+            kind="count_true",
+            source="truncated",
+            normalize_by="rollouts",
+            as_percent=True,
+        ),
+        "avg_prompt_length": Reducer(
+            kind="mean",
+            source="prompt_length",
+        ),
+        "avg_completion_length": Reducer(
+            kind="mean",
+            source="completion_length",
         ),
         "total_completion_tokens": Reducer(
             kind="sum",
@@ -244,6 +265,9 @@ def main():
             "loss_rate",
             "draw_rate",
             "illegal_rate",
+            "parse_error_rate",
+            "truncated_rate",
+            "avg_prompt_length",
             "avg_completion_length",
             "total_completion_tokens",
             "eval_win_rate",
@@ -251,6 +275,7 @@ def main():
             "eval_draw_rate",
             "eval_illegal_rate",
             "eval_parse_error_rate",
+            "eval_truncated_rate",
             "eval_avg_completion_tokens",
             "num_rollouts",
             "num_samples",
@@ -265,7 +290,8 @@ def main():
         "loss_rate": Reducer(kind="count_true", source="result", transform=lambda v: v == "loss", normalize_by="rollouts", as_percent=True),
         "draw_rate": Reducer(kind="count_true", source="result", transform=lambda v: v == "draw", normalize_by="rollouts", as_percent=True),
         "illegal_rate": Reducer(kind="count_true", source="illegal_move", normalize_by="rollouts", as_percent=True),
-        "parse_error_rate": Reducer(kind="count_true", source="parse_error", normalize_by="samples", as_percent=True),
+        "parse_error_rate": Reducer(kind="count_true", source="parse_error", normalize_by="rollouts", as_percent=True),
+        "truncated_rate": Reducer(kind="count_true", source="truncated", normalize_by="rollouts", as_percent=True),
         "avg_completion_tokens": Reducer(kind="mean", source="completion_length"),
     }
 

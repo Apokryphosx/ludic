@@ -37,15 +37,17 @@ def create_engine(client: VLLMChatClient) -> RolloutEngine:
     env_registry = {"tictactoe": lambda **kwargs: TicTacToeEnv(**kwargs)}
     
     # 2. Protocol Factory
-    def create_protocol(prompt: str | None = None):
+    training_prompt = base_prompt + "\n\nOutput your move as a single XML tag, e.g., <move>A1</move>."
+
+    def create_protocol():
         return SingleAgentSyncProtocol(
             agent=Agent(
                 client=client, 
                 model=MODEL_NAME, 
-                ctx=FullDialog(), 
+                ctx=FullDialog(system_prompt=training_prompt), 
                 parser=xml_tag_parser("move")
             ),
-            prompt=prompt,
+            stop_on_parse_error=True,
         )
 
     protocol_registry = {"single_agent": create_protocol}
@@ -66,12 +68,14 @@ def make_requests() -> list[RolloutRequest]:
         "extras": {"extra_body": {"return_token_ids": True}} 
     }
     
-    return [RolloutRequest(
-        env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": True}),
-        protocol=ProtocolSpec(kind="single_agent", kwargs={"prompt": training_prompt}),
-        sampling_args=sampling_args, 
-        num_episodes=1, 
-    )]
+    return [
+        RolloutRequest(
+            env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": True}),
+            protocol=ProtocolSpec(kind="single_agent", kwargs={}),
+            sampling_args=sampling_args, 
+            num_episodes=1, 
+        )
+    ]
 
 async def main():
     print("🎬 Starting ACTOR Node")

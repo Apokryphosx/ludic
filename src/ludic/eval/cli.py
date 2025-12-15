@@ -28,7 +28,7 @@ def add_common_eval_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--timeout-s", type=float, default=None, help="Per-call timeout.")
-    parser.add_argument("--concurrency", type=int, default=32, help="Parallel episodes.")
+    parser.add_argument("--concurrency", type=int, default=64, help="Parallel episodes.")
     parser.add_argument("--max-steps", type=int, default=1, help="Max steps per episode.")
     parser.add_argument("--out", type=str, default=None, help="Output JSONL path.")
     parser.add_argument(
@@ -76,15 +76,22 @@ def build_single_agent_engine(
     parser: Callable[[str], ParseResult],
     env_registry: Mapping[str, Callable[..., Any]],
     system_prompt: Optional[str] = None,
+    stop_on_parse_error: bool = False,
+    context_factory: Optional[Callable[[Optional[str]], Any]] = None,
 ) -> RolloutEngine:
+    make_ctx = context_factory or (lambda sp: FullDialog(system_prompt=sp))
+
     def protocol_factory() -> SingleAgentSyncProtocol:
         agent = Agent(
             client=client,
             model=model,
-            ctx=FullDialog(),
+            ctx=make_ctx(system_prompt),
             parser=parser,
         )
-        return SingleAgentSyncProtocol(agent=agent, prompt=system_prompt)
+        return SingleAgentSyncProtocol(
+            agent=agent,
+            stop_on_parse_error=stop_on_parse_error,
+        )
 
     return RolloutEngine(
         env_registry=dict(env_registry),
@@ -104,4 +111,3 @@ def write_jsonl(path: str, records: Iterable[Mapping[str, Any]]) -> None:
     with open(path, "w", encoding="utf-8") as f:
         for rec in records:
             f.write(json.dumps(dict(rec), ensure_ascii=False) + "\n")
-

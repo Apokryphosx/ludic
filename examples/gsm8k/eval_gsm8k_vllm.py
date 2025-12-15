@@ -151,7 +151,7 @@ def main() -> None:
             env_registry={
                 "gsm8k": lambda sample, system_prompt=None: GSM8KEnv(sample=sample, system_prompt=system_prompt)
             },
-            system_prompt=None,
+            system_prompt=args.system_prompt,
         )
         requests = make_requests(samples, args)
 

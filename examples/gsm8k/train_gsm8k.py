@@ -147,9 +147,8 @@ def main():
     sampling_args = {
         "temperature": args.train_temperature,
         "max_tokens": 512,
-        # Ask vLLM for token IDs + sampled logprobs so GRPO can use rollout-time
-        # behavior logprobs instead of backfilling them on the trainer side.
-        "extras": {"extra_body": {"return_token_ids": True, "return_logprobs": True}},
+        # Ask vLLM for token IDs + logprobs so GRPO can use rollout-time behavior logprobs.
+        "extras": {"extra_body": {"return_token_ids": True, "logprobs": True, "top_logprobs": 1}},
     }
     requests_fn = make_dataset_queue_requests_fn(
         samples_q,

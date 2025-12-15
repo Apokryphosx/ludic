@@ -30,6 +30,7 @@ from ludic.eval.cli import (
     sampling_args_from_cli,
     write_jsonl,
 )
+from ludic.context import FullDialog, TruncatedThinkingContext
 
 
 TICTACTOE_REDUCERS: Dict[str, Reducer] = {
@@ -38,6 +39,7 @@ TICTACTOE_REDUCERS: Dict[str, Reducer] = {
     "draw_rate": Reducer(kind="count_true", source="result", transform=lambda v: v == "draw", normalize_by="rollouts", as_percent=True),
     "illegal_rate": Reducer(kind="count_true", source="illegal_move", normalize_by="rollouts", as_percent=True),
     "parse_error_rate": Reducer(kind="count_true", source="parse_error", normalize_by="rollouts", as_percent=True),
+    "truncated_rate": Reducer(kind="count_true", source="truncated", normalize_by="rollouts", as_percent=True),
     "avg_completion_tokens": Reducer(kind="mean", source="completion_length"),
 }
 
@@ -49,7 +51,10 @@ def make_requests(episodes: int, args: argparse.Namespace) -> List[RolloutReques
             env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": True}),
             protocol=ProtocolSpec(kind="single_agent"),
             seed=seed,
-            sampling_args=sargs,
+            sampling_args={
+                **sargs,
+                "extras": {"extra_body": {"return_token_ids": True}},
+            },
             num_episodes=1,
             meta={"seed": seed},
         )
@@ -62,6 +67,7 @@ def make_parser() -> argparse.ArgumentParser:
     add_common_eval_args(parser)
     parser.add_argument("--episodes", type=int, default=200, help="Number of episodes.")
     parser.set_defaults(temperature=0.6, max_tokens=250, max_steps=5, out="tictactoe_eval.jsonl")
+    parser.add_argument("--truncate-cot", action="store_true", help="Use TruncatedThinkingContext to collapse <think>...</think> in the prompt.")
     return parser
 
 
@@ -78,26 +84,21 @@ def main() -> None:
 
     with maybe_start_vllm(args):
         client = VLLMChatClient(host=args.host, port=args.port, enable_weight_updates=False)
+        ctx_factory = (
+            (lambda sp: TruncatedThinkingContext(system_prompt=sp))
+            if args.truncate_cot
+            else (lambda sp: FullDialog(system_prompt=sp))
+        )
         engine = build_single_agent_engine(
             client=client,
             model=args.model,
             parser=compose_parsers(think_prefix_parser, xml_tag_parser("move", exact=True)),
             env_registry={"tictactoe": lambda agent_starts=True: TicTacToeEnv(agent_starts=agent_starts)},
             system_prompt=system_prompt,
+            context_factory=ctx_factory,
+            stop_on_parse_error=True,
         )
         requests = make_requests(args.episodes, args)
-
-        def _fmt_metric(name: str, value: float) -> str:
-            reducer = TICTACTOE_REDUCERS.get(name)
-            if reducer is not None and reducer.as_percent:
-                return f"{name}={value:.2%}"
-            return f"{name}={value:.4g}"
-
-        def _progress(done: int, total: int, stats: Dict[str, float]) -> None:
-            parts = [f"[{done}/{total}]"]
-            for k, v in stats.items():
-                parts.append(_fmt_metric(k, v))
-            print(" ".join(parts))
 
         records, metrics = run_eval_sync(
             engine=engine,
@@ -106,13 +107,15 @@ def main() -> None:
             max_steps=args.max_steps,
             timeout_s=args.timeout_s,
             concurrency=args.concurrency,
-            progress_every=args.concurrency,
-            progress_fn=_progress,
         )
 
         print("\n---- Tic-Tac-Toe Evaluation ----")
         for k, v in metrics.items():
-            print(_fmt_metric(k, float(v)))
+            reducer = TICTACTOE_REDUCERS.get(k)
+            if reducer is not None and reducer.as_percent:
+                print(f"{k}={float(v):.2%}")
+            else:
+                print(f"{k}={float(v):.4g}")
 
         if args.out:
             write_jsonl(args.out, records)

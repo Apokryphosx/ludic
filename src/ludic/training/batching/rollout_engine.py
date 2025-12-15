@@ -117,6 +117,7 @@ def _base_item_meta(
     action: str,
     truncated: bool,
     terminated: bool,
+    prompt_len: int | None = None,
 ) -> Dict[str, Any]:
     return {
         "rollout_id": rollout.id,
@@ -126,6 +127,7 @@ def _base_item_meta(
         "action": action,
         "total_reward": rollout.total_reward,
         "completion_length": comp_len,
+        "prompt_length": prompt_len,
         "truncated": truncated,
         "terminated": terminated,
         **(rollout.meta),  # Rollout-level meta (includes episode_truncated, truncation_reason)
@@ -161,6 +163,7 @@ def _saw_item_from_model_ids(
         action=action,
         truncated=truncated,
         terminated=terminated,
+        prompt_len=len(prompt_ids),
     )
     meta.update(step_info)
     if completion_logprobs is not None:
@@ -208,6 +211,7 @@ def _saw_item_from_retokenize(
         action=action,
         truncated=truncated,
         terminated=terminated,
+        prompt_len=len(state_ids),
     )
     meta.update(_drop_model_trace_keys(step_info))
 
@@ -441,7 +445,7 @@ class RolloutEngine:
         )
         weights = credit_assigner.compute(rollouts)
 
-        items_with_lengths: List[Tuple[SAWItem, int]] = []
+        items_with_lengths: List[Tuple[SAWItem, int, int]] = []
 
         for r in rollouts:
             for step in r.steps:
@@ -454,6 +458,7 @@ class RolloutEngine:
 
                 if model_ids is not None and not retokenize:
                     prompt_ids, completion_ids = model_ids
+                    prompt_len = len(prompt_ids)
                     completion_logprobs = _coerce_completion_logprobs(
                         info.get("completion_logprobs"),
                         completion_ids=completion_ids,
@@ -474,6 +479,7 @@ class RolloutEngine:
                         truncated=step.truncated,
                         terminated=step.terminated,
                     )
+                    items_with_lengths.append((item, prompt_len, comp_len))
                 else:
                     if not retokenize:
                         raise ValueError(
@@ -495,22 +501,23 @@ class RolloutEngine:
                         truncated=step.truncated,
                         terminated=step.terminated,
                     )
-
-                items_with_lengths.append((item, comp_len))
+                    prompt_len = len(item.input_ids) - comp_len
+                    items_with_lengths.append((item, prompt_len, comp_len))
 
         # ---- Apply sample filter ------------------------------------------
         num_before_filter = len(items_with_lengths)
         if sample_filter is not None:
             items_with_lengths = [
-                (item, comp_len)
-                for (item, comp_len) in items_with_lengths
+                (item, prompt_len, comp_len)
+                for (item, prompt_len, comp_len) in items_with_lengths
                 if sample_filter(item)
             ]
         num_after_filter = len(items_with_lengths)
         num_filtered = num_before_filter - num_after_filter
 
-        items: List[SAWItem] = [item for (item, _comp_len) in items_with_lengths]
-        completion_lengths: List[int] = [comp_len for (_item, comp_len) in items_with_lengths]
+        items: List[SAWItem] = [item for (item, _prompt_len, _comp_len) in items_with_lengths]
+        prompt_lengths: List[int] = [p for (_item, p, _c) in items_with_lengths]
+        completion_lengths: List[int] = [comp_len for (_item, _p, comp_len) in items_with_lengths]
 
         # ---- Build batch-level metadata -----------------------------------
         # Note: num_rollouts reflects total number of *agent trajectories*, not global env episodes.
@@ -526,6 +533,10 @@ class RolloutEngine:
             "avg_completion_length": (
                 float(sum(completion_lengths) / len(completion_lengths))
                 if completion_lengths else 0.0
+            ),
+            "avg_prompt_length": (
+                float(sum(prompt_lengths) / len(prompt_lengths))
+                if prompt_lengths else 0.0
             ),
         }
 

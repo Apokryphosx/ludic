@@ -15,12 +15,7 @@ This example shows how to run Ludic with PyTorch FSDP2 for training while servin
 - Training runs under `torchrun` with NCCL; vLLM weight pushes use a separate NCCL communicator (`pynccl`) owned by the client. They do not interfere.
 
 ## Quickstart (template)
-You can run everything with the helper script:
-```bash
-bash examples/fsdp2_training/run_example.sh
-```
-
-1. Start vLLM on GPU0 (example using the bundled server):
+1. Start vLLM on GPU0 (using the bundled server):
    ```bash
    CUDA_VISIBLE_DEVICES=0 uv run python -m ludic.inference.vllm_server \
      --model Qwen/Qwen2.5-7B-Instruct \
@@ -29,7 +24,7 @@ bash examples/fsdp2_training/run_example.sh
      --max-num-seqs 32
    ```
 
-2. Launch training on GPUs 1–3:
+2. Launch training on GPUs 1–3 (FSDP2 + grouped-advantage REINFORCE):
    ```bash
    # Pin training to GPUs 1,2,3 so GPU0 stays free for vLLM
    CUDA_VISIBLE_DEVICES=1,2,3 PYTHONPATH=. PYTHONUNBUFFERED=1 uv run torchrun --nproc_per_node=3 \
@@ -48,25 +43,7 @@ bash examples/fsdp2_training/run_example.sh
      --rank0-only-output
    ```
 
-   If your node has a large local scratch disk (e.g. `/ephemeral`), point caches and checkpoints there:
-   ```bash
-   CUDA_VISIBLE_DEVICES=1,2,3 PYTHONPATH=. PYTHONUNBUFFERED=1 UV_CACHE_DIR=/ephemeral/uv_cache uv run torchrun --nproc_per_node=3 \
-     examples/fsdp2_training/train_math_fsdp2.py \
-     --model Qwen/Qwen2.5-7B-Instruct \
-     --vllm-host 127.0.0.1 \
-     --vllm-port 8000 \
-     --rollout-log /ephemeral/fsdp2_math_rollouts.jsonl \
-     --checkpoint-dir /ephemeral/checkpoints_math_fsdp2 \
-     --limit 2048 \
-     --train-steps 50 --group-size 8 \
-     --concurrency 11 --batch-size 1 --train-temperature 1.0 \
-     --eval-before-start --eval-every 10 --eval-limit 100 \
-     --eval-concurrency 32 --eval-temperature 0.0 \
-     --max-tokens 1024 \
-     --log-level INFO \
-     --logger print \
-     --rank0-only-output
-   ```
+   Optional: if you have fast scratch (e.g. `/ephemeral`), set `UV_CACHE_DIR`, `--rollout-log`, and `--checkpoint-dir` there to reduce I/O contention.
 
 3. Checkpoints and logs:
    - Checkpoints: `checkpoints_math_fsdp2/` (rank0 saves).

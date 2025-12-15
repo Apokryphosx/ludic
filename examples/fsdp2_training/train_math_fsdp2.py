@@ -276,7 +276,7 @@ def main() -> None:
             agent=Agent(
                 client=client,
                 model=args.model,
-                ctx=FullDialog(),
+                ctx=FullDialog(system_prompt=args.system_prompt),
                 parser=action_parser,
             )
         )

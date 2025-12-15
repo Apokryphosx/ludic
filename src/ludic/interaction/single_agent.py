@@ -22,22 +22,33 @@ class SingleAgentSyncProtocol(InteractionProtocol):
       reward=parse_result.reward, next_obs=parse_result.obs (or
       "Invalid action."), and info including parse_error=True. The
       synthetic observation is fed back into the agent context for the
-      next turn.
+      next turn. Optionally, the protocol can terminate immediately on the
+      first parse error.
+
+    System prompt resolution:
+      Uses the context's default_system_prompt if present; otherwise falls
+      back to env.suggested_sysprompt. There is no protocol-level prompt
+      override.
     """
     
-    def __init__(self, agent: Agent, prompt: Optional[str] = None):
+    def __init__(
+        self,
+        agent: Agent,
+        *,
+        stop_on_parse_error: bool = False,
+    ):
         """
         Initializes the protocol.
         
         Args:
             agent: A fully-configured Agent instance.
-            prompt: An optional system prompt override. 
-                    If set, this takes priority over the environment's 
-                    suggested_sysprompt. This allows you to decouple 
-                    prompt engineering from environment logic.
+            stop_on_parse_error:
+                If True, terminate the episode after the first parser failure.
+                If False (default), continue and feed the synthetic
+                observation back to the agent.
         """
         self.agent = agent
-        self.prompt = prompt
+        self.stop_on_parse_error = stop_on_parse_error
 
     async def run(
         self,
@@ -67,11 +78,10 @@ class SingleAgentSyncProtocol(InteractionProtocol):
         obs, info = obs_info_dict[agent_id]
         
         # 3. --- Reset Agent & Feed First Obs ---
-        # Protocol prompt takes priority over Env prompt
-        if self.prompt is not None:
-            sys_prompt = self.prompt
-        else:
-            sys_prompt = getattr(env, "suggested_sysprompt", None)
+        # Choose system prompt: prefer the context's default if set, else env suggestion.
+        ctx_default_prompt = getattr(getattr(agent, "_ctx", None), "default_system_prompt", None)
+        env_prompt = getattr(env, "suggested_sysprompt", None)
+        sys_prompt = ctx_default_prompt or env_prompt
 
         agent.reset(system_prompt=sys_prompt)
         agent.on_env_reset(obs, info)
@@ -81,6 +91,7 @@ class SingleAgentSyncProtocol(InteractionProtocol):
 
         # 4. --- Run Interaction Loop ---
         for t in range(max_steps):
+            parse_halt = False
             
             # Check that our agent is the one expected to act
             active_agents = env.active_agents
@@ -95,18 +106,19 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                 sampling_args=sargs,
                 timeout_s=timeout_s
             )
-
             # --- B. Handle Parser Failure ---
             if parse_result.action is None:
                 synthetic_obs = parse_result.obs or "Invalid action."
                 parser_reward = parse_result.reward
+                terminated_on_parse = bool(self.stop_on_parse_error)
+                parse_halt = terminated_on_parse
 
                 # Create a synthetic outcome
                 outcome = StepOutcome(
                     obs=synthetic_obs,
                     reward=parser_reward,
                     truncated=False,
-                    terminated=False,
+                    terminated=terminated_on_parse,
                     info=merge_step_info(
                         client_info=client_info,
                         extra={"parse_error": True},
@@ -120,10 +132,12 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                     action=raw_action,
                     next_obs=synthetic_obs,
                     reward=parser_reward,
-                    truncated=False,
-                    terminated=False,
+                    truncated=outcome.truncated,
+                    terminated=outcome.terminated,
                     info=outcome.info,
                 ))
+                # When stopping on parse error, we still want to feed the synthetic
+                # observation back into the context before exiting.
 
             # --- C. Handle Parser Success (Step Env) ---
             else:
@@ -175,7 +189,8 @@ class SingleAgentSyncProtocol(InteractionProtocol):
             # --- D. Update state for next loop ---
             obs = outcome.obs
             info = outcome.info
-
+            if parse_halt:
+                agent.on_after_step(obs, info)
             if outcome.terminated or outcome.truncated:
                 break # Exit loop
             else:
@@ -218,5 +233,4 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                 "truncation_reason": truncation_reason,
             }
         )
-
         return [rollout]
