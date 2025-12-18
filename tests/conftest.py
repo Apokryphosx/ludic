@@ -8,13 +8,20 @@ import time
 from typing import Optional, Tuple
 
 import pytest
-import requests
-from requests import ConnectionError as RequestsConnectionError
 
-from ludic.inference.vllm_client import VLLMChatClient
+try:
+    import requests  # type: ignore
+    from requests import ConnectionError as RequestsConnectionError  # type: ignore
+except ModuleNotFoundError:
+    requests = None  # type: ignore[assignment]
+    RequestsConnectionError = ConnectionError  # type: ignore[assignment]
+
+try:
+    from ludic.inference.vllm_client import VLLMChatClient
+except ModuleNotFoundError:
+    VLLMChatClient = None  # type: ignore[assignment]
 
 from ludic.context.full_dialog import FullDialog
-from tests._mocks import MockEnv, MockAgent
 
 # ---------------------------------------------------------------------------
 # Server fixture: launch ludic.inference.vllm_server end-to-end
@@ -43,6 +50,9 @@ class VLLMServerHandle:
         return self.host, self.port
 
     def start(self) -> None:
+        if requests is None:
+            raise RuntimeError("requests is required to run the vLLM server fixture.")
+
         if self.proc is not None and self.proc.poll() is None:
             return
 
@@ -178,6 +188,8 @@ def vllm_model_name() -> str:
 @pytest.fixture(scope="session")
 def vllm_client(vllm_host_port: Tuple[str, int]) -> VLLMChatClient:
     host, port = vllm_host_port
+    if VLLMChatClient is None:
+        pytest.skip("VLLMChatClient could not be imported (missing optional deps).")
     try:
         return VLLMChatClient(
             host=host,
@@ -193,6 +205,10 @@ def env_registry():
     """
     Registry mapping env kind -> factory. Used by RolloutEngine tests.
     """
+    try:
+        from tests._mocks import MockEnv
+    except ModuleNotFoundError as exc:
+        pytest.skip(f"MockEnv could not be imported (missing optional deps): {exc}")
     return {
         "mock": lambda **kwargs: MockEnv(**kwargs),
     }
@@ -213,4 +229,8 @@ def mock_agent():
     """
     Real Agent wired to MockClient (from tests._mocks).
     """
+    try:
+        from tests._mocks import MockAgent
+    except ModuleNotFoundError as exc:
+        pytest.skip(f"MockAgent could not be imported (missing optional deps): {exc}")
     return MockAgent()

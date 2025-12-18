@@ -19,7 +19,9 @@ class BlackjackEnv(SingleAgentEnv):
     """
 
     DEFAULT_SYSTEM_PROMPT = (
-        "You are playing Blackjack against a dealer. Respond with HIT or STAND."
+        "You are playing Blackjack against a dealer.\n"
+        "On each turn, choose whether to take another card or hold.\n"
+        "Reply with exactly one XML tag: <move>HIT</move> or <move>STAND</move>."
     )
 
     RANKS: Sequence[str] = ("A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K")

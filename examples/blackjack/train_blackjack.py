@@ -19,12 +19,12 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 from typing import Callable, List
 
 import torch
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from functools import partial
 
 from environments.blackjack import BlackjackEnv
 from ludic.agent import Agent
@@ -33,7 +33,7 @@ from ludic.distributed.adapters import create_vllm_publisher
 from ludic.eval import EngineEvaluator
 from ludic.inference import InferenceSpec, ReturnSpec, SamplingParams, VLLMChatClient
 from ludic.interaction import SingleAgentSyncProtocol
-from ludic.parsers import ParseResult, think_prefix_parser
+from ludic.parsers import ParseResult, compose_parsers, think_prefix_parser, xml_tag_parser
 from ludic.training import (
     CheckpointConfig,
     EnvSpec,
@@ -52,38 +52,24 @@ from ludic.training import (
 )
 
 
-_ACTION_ANYWHERE_RE = re.compile(r"\b(hit|stand|stay)\b", flags=re.IGNORECASE)
-_ACTION_EXACT_RE = re.compile(r"^\s*(hit|stand|stay)\s*$", flags=re.IGNORECASE)
-
-
-def blackjack_parser(raw: str) -> ParseResult:
-    """
-    Parse HIT/STAND actions.
-
-    - If output is exactly HIT/STAND(/STAY), treat as success (no penalty).
-    - Else, if HIT/STAND(/STAY) appears anywhere, extract the last occurrence and
-      apply a small format penalty to discourage extra text.
-    - Else, return a parse failure with a larger penalty.
-    """
-    cot = think_prefix_parser(raw, success_reward=0.0, error_reward=0.0)
-    text = cot.action if cot.action is not None else raw
-
-    exact = _ACTION_EXACT_RE.match(text.strip())
-    if exact:
-        action = exact.group(1).lower()
-        return ParseResult(action=("STAND" if action == "stay" else action.upper()), reward=0.0, obs=None)
-
-    matches = _ACTION_ANYWHERE_RE.findall(text)
-    if matches:
-        action = matches[-1].lower()
-        action_out = "STAND" if action == "stay" else action.upper()
-        return ParseResult(action=action_out, reward=-0.2, obs=None)
-
+def _normalize_blackjack_move(action: str) -> ParseResult:
+    a = action.strip().lower()
+    if a in {"hit", "h"}:
+        return ParseResult(action="HIT", reward=0.0, obs=None)
+    if a in {"stand", "stay", "s"}:
+        return ParseResult(action="STAND", reward=0.0, obs=None)
     return ParseResult(
         action=None,
         reward=-1.0,
-        obs="Invalid action. Reply with HIT or STAND.",
+        obs="Invalid move. Use HIT or STAND inside <move>...</move>.",
     )
+
+
+BLACKJACK_PARSER = compose_parsers(
+    partial(think_prefix_parser, success_reward=0.0, error_reward=-1.0),
+    xml_tag_parser("move", exact=True, success_reward=0.0, error_reward=-1.0),
+    _normalize_blackjack_move,
+)
 
 
 def build_requests_fn(
@@ -161,7 +147,10 @@ def main() -> None:
     parser.add_argument(
         "--system-prompt",
         type=str,
-        default=BlackjackEnv.DEFAULT_SYSTEM_PROMPT + " Do not output any other text.",
+        default=(
+            BlackjackEnv.DEFAULT_SYSTEM_PROMPT
+            + "\n\nThink in <think>...</think>. After </think>, output exactly one <move>...</move> tag and nothing else."
+        ),
         help="System prompt override (pass '' to disable).",
     )
 
@@ -225,7 +214,7 @@ def main() -> None:
                 client=client,
                 model=args.model,
                 ctx=ctx,
-                parser=blackjack_parser,
+                parser=BLACKJACK_PARSER,
             ),
             stop_on_parse_error=True,
         )
