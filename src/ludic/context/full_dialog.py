@@ -1,8 +1,7 @@
 from __future__ import annotations
 from typing import List
 from ludic.context.base import ContextStrategy
-from ludic.inference.client import ChatResponse
-from ludic.types import Message, Observation, Info
+from ludic.types import ChatResponse, Message, Observation, Info
 
 class FullDialog(ContextStrategy):
     def on_env_reset(self, obs: Observation, info: Info) -> None:
