@@ -38,6 +38,7 @@ from ludic.training import (
     make_sft,
     make_chat_template_step_to_item,
 )
+from ludic.training.loggers import WandbLogger
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +88,20 @@ def main() -> None:
         default=True,
         help="Enable HF gradient checkpointing.",
     )
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging (rank 0 only).")
+    parser.add_argument("--wandb-project", type=str, default=None, help="W&B project name.")
+    parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity/team name.")
+    parser.add_argument("--wandb-name", type=str, default=None, help="W&B run name.")
+    parser.add_argument("--wandb-group", type=str, default=None, help="W&B group name.")
+    parser.add_argument("--wandb-tags", type=str, default=None, help="Comma-separated W&B tags.")
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        choices=["online", "offline", "disabled"],
+        default=None,
+        help="Override W&B mode (or set WANDB_MODE env var).",
+    )
+    parser.add_argument("--wandb-dir", type=str, default=None, help="W&B run directory.")
     args = parser.parse_args()
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -185,6 +200,38 @@ def main() -> None:
             Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
         dist.barrier()
 
+    train_logger = None
+    if args.wandb and rank == 0:
+        init_kwargs = {}
+        if args.wandb_project:
+            init_kwargs["project"] = args.wandb_project
+        if args.wandb_entity:
+            init_kwargs["entity"] = args.wandb_entity
+        if args.wandb_name:
+            init_kwargs["name"] = args.wandb_name
+        if args.wandb_group:
+            init_kwargs["group"] = args.wandb_group
+        if args.wandb_mode:
+            init_kwargs["mode"] = args.wandb_mode
+        if args.wandb_dir:
+            init_kwargs["dir"] = args.wandb_dir
+        if args.wandb_tags:
+            init_kwargs["tags"] = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
+        init_kwargs["config"] = {
+            "model": args.model,
+            "data": str(data_path),
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "grad_accum": args.grad_accum,
+            "max_grad_norm": args.max_grad_norm,
+            "checkpoint_every": args.checkpoint_every,
+            "max_to_keep": args.max_to_keep,
+            "gradient_checkpointing": bool(args.gradient_checkpointing),
+            "world_size": world_size,
+        }
+        train_logger = WandbLogger(init_kwargs=init_kwargs)
+
     trainer = Trainer(
         model=model,
         algo=algo,
@@ -193,7 +240,7 @@ def main() -> None:
         cfg=cfg,
         checkpoint_config=checkpoint_cfg,
         enable_gradient_checkpointing=bool(args.gradient_checkpointing),
-        train_logger=None,
+        train_logger=train_logger,
         evaluator=None,
     )
 

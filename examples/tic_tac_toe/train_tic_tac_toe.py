@@ -42,7 +42,8 @@ from ludic.training import (
     GRPORequestStrategy,
     ReinforceLoss,
 )
-from ludic.training import Reducer, RichLiveLogger
+from ludic.training import Reducer
+from ludic.training.loggers import WandbLogger
 
 # STRICT: require <think>...</think> then exactly one <move>...</move>.
 # Success reward is set to 0.0 so multiple turns do not gain extra parser reward.
@@ -56,14 +57,12 @@ def build_requests_fn(
     rng: torch.Generator,
     batch_size: int,
     inference: InferenceSpec,
+    *,
+    agent_starts: bool,
 ):
     def _fn() -> List[RolloutRequest]:
         reqs: List[RolloutRequest] = []
-        # 50/50 split between agent starting first vs second.
-        start_flags = [True] * ((batch_size + 1) // 2) + [False] * (batch_size // 2)
-        perm = torch.randperm(len(start_flags), generator=rng).tolist()
-        for idx in perm:
-            agent_starts = bool(start_flags[idx])
+        for _ in range(batch_size):
             seed = int(torch.randint(0, 2**31 - 1, (1,), generator=rng).item())
             reqs.append(
                 RolloutRequest(
@@ -114,6 +113,12 @@ def main():
                         help="Context strategy: 'full' (FullDialog) or 'truncated' (TruncatedThinkingContext)")
     parser.add_argument("--final-save", action="store_true", help="Save a final checkpoint after training completes.")
     parser.add_argument("--positive-only", action="store_true", help="Only learn from positive advantages; clip negative ones to 0.")
+    parser.add_argument("--start-as-x", action="store_true", help="If set, agent starts as X; otherwise agent starts as O.")
+    parser.add_argument("--wandb-project", type=str, default="ludic-tictactoe")
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-name", type=str, default=None)
+    parser.add_argument("--wandb-group", type=str, default=None)
+    parser.add_argument("--wandb-tags", type=str, default=None, help="Comma-separated W&B tags.")
 
     args = parser.parse_args()
 
@@ -201,7 +206,12 @@ def main():
         sampling=SamplingParams(temperature=args.train_temperature, max_tokens=250),
         return_=ReturnSpec.for_eval(return_token_ids=True),
     )
-    base_requests_fn = build_requests_fn(rng, args.batch_size, train_inference)
+    base_requests_fn = build_requests_fn(
+        rng,
+        args.batch_size,
+        train_inference,
+        agent_starts=bool(args.start_as_x),
+    )
     # Expand each logical request into a group with shared env seed and diverse sampling seeds.
     def requests_fn() -> List[RolloutRequest]:
         return GRPORequestStrategy(group_size=args.group_size).expand(base_requests_fn())
@@ -282,33 +292,42 @@ def main():
         ),
     }
 
-    train_logger = RichLiveLogger(
-        keys=[
-            "loss",
-            "avg_total_reward",
-            "win_rate",
-            "loss_rate",
-            "draw_rate",
-            "illegal_rate",
-            "parse_error_rate",
-            "truncated_rate",
-            "avg_prompt_length",
-            "avg_completion_length",
-            "total_completion_tokens",
-            "eval_win_rate",
-            "eval_loss_rate",
-            "eval_draw_rate",
-            "eval_illegal_rate",
-            "eval_parse_error_rate",
-            "eval_truncated_rate",
-            "eval_avg_completion_tokens",
-            "num_rollouts",
-            "num_samples",
-        ],
-        spark_key="avg_total_reward",
-        history=100,
-        precision=4,
-    )
+    init_kwargs = {
+        "project": args.wandb_project,
+        "entity": args.wandb_entity,
+        "name": args.wandb_name,
+        "group": args.wandb_group,
+        "mode": "online",
+        "config": {
+            "model": args.model,
+            "seed": args.seed,
+            "concurrency": args.concurrency,
+            "batch_size": args.batch_size,
+            "train_steps": args.train_steps,
+            "max_steps_per_episode": args.max_steps_per_episode,
+            "group_size": args.group_size,
+            "lora_rank": args.lora_rank,
+            "lora_alpha_mult": args.lora_alpha_mult,
+            "lora_dropout": args.lora_dropout,
+            "train_temperature": args.train_temperature,
+            "eval_every": args.eval_every,
+            "eval_before_start": bool(args.eval_before_start),
+            "eval_episodes": args.eval_episodes,
+            "eval_concurrency": args.eval_concurrency,
+            "eval_temperature": args.eval_temperature,
+            "rollout_log": args.rollout_log,
+            "checkpoint_dir": args.checkpoint_dir,
+            "checkpoint_every": args.checkpoint_every,
+            "max_to_keep": args.max_to_keep,
+            "ctx": args.ctx,
+            "final_save": bool(args.final_save),
+            "positive_only": bool(args.positive_only),
+            "start_as_x": bool(args.start_as_x),
+        },
+    }
+    if args.wandb_tags:
+        init_kwargs["tags"] = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
+    train_logger = WandbLogger(init_kwargs=init_kwargs)
 
     eval_reducers = {
         "win_rate": Reducer(kind="count_true", source="result", transform=lambda v: v == "win", normalize_by="rollouts", as_percent=True),
@@ -349,7 +368,7 @@ def main():
                         meta={"eval_seed": seed, "agent_starts": agent_starts},
                     )
                     for seed, agent_starts in enumerate(
-                        [True] * ((args.eval_episodes + 1) // 2) + [False] * (args.eval_episodes // 2)
+                        [bool(args.start_as_x)] * args.eval_episodes
                     )
                 ],
                 reducers=eval_reducers,
