@@ -57,14 +57,30 @@ def build_requests_fn(
     rng: torch.Generator,
     batch_size: int,
     inference: InferenceSpec,
+    *,
+    balance_window: int = 1,
 ):
-    def _fn() -> List[RolloutRequest]:
-        reqs: List[RolloutRequest] = []
-        # 50/50 split between agent starting first vs second.
-        start_flags = [True] * ((batch_size + 1) // 2) + [False] * (batch_size // 2)
+    balance_window = max(1, int(balance_window))
+    start_flag_pool: List[bool] = []
+    pool_idx = 0
+
+    def _refill_pool() -> None:
+        nonlocal start_flag_pool, pool_idx
+        total = batch_size * balance_window
+        # Balance start positions across the whole window (e.g., one grad-accum step).
+        start_flags = [True] * ((total + 1) // 2) + [False] * (total // 2)
         perm = torch.randperm(len(start_flags), generator=rng).tolist()
-        for idx in perm:
-            agent_starts = bool(start_flags[idx])
+        start_flag_pool = [start_flags[i] for i in perm]
+        pool_idx = 0
+
+    def _fn() -> List[RolloutRequest]:
+        nonlocal pool_idx
+        reqs: List[RolloutRequest] = []
+        if pool_idx + batch_size > len(start_flag_pool):
+            _refill_pool()
+        batch_flags = start_flag_pool[pool_idx:pool_idx + batch_size]
+        pool_idx += batch_size
+        for agent_starts in batch_flags:
             seed = int(torch.randint(0, 2**31 - 1, (1,), generator=rng).item())
             reqs.append(
                 RolloutRequest(
@@ -209,7 +225,12 @@ def main():
         sampling=SamplingParams(temperature=args.train_temperature, max_tokens=250),
         return_=ReturnSpec.for_eval(return_token_ids=True),
     )
-    base_requests_fn = build_requests_fn(rng, args.batch_size, train_inference)
+    base_requests_fn = build_requests_fn(
+        rng,
+        args.batch_size,
+        train_inference,
+        balance_window=args.grad_accum_steps,
+    )
     # Expand each logical request into a group with shared env seed and diverse sampling seeds.
     def requests_fn() -> List[RolloutRequest]:
         return GRPORequestStrategy(group_size=args.group_size).expand(base_requests_fn())
